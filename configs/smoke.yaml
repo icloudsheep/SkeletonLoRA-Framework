@@ -1,0 +1,39 @@
+# Smoke config: dummy model + dummy dataset, macOS CPU can finish in ~30s.
+# Kept in repo as a permanent regression entry point.
+
+seed: 42
+
+federated:
+  num_clients: 2
+  num_rounds: 2
+  local_steps: 5
+  # FedAvg with equal weights (data split uniformly).
+
+lora:
+  rank: 2
+  alpha: 4
+  target_modules: ["linear"]   # dummy model only has a Linear named "linear"
+
+train:
+  batch_size: 4
+  learning_rate: 2.0e-4
+  optimizer: adamw
+  weight_decay: 0.0
+  dtype: float32               # dummy stays fp32; real config switches to bf16
+
+model:
+  kind: dummy                  # dispatch key -> models/dummy.py
+  hidden_size: 16
+
+dataset:
+  kind: dummy                  # dispatch key -> datasets/dummy.py
+  split_method: iid_uniform
+  num_samples: 64
+  input_dim: 16
+  output_dim: 16
+
+logging:
+  level: INFO                  # DEBUG only lands in file, INFO+ also to console
+
+tensorboard:
+  port: 6006

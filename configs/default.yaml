@@ -1,0 +1,37 @@
+# Default config: real base model + real dataset placeholder.
+# Fill dataset.path and models weight location before running.
+
+seed: 42
+
+federated:
+  num_clients: 4
+  num_rounds: 10
+  local_steps: 50
+
+lora:
+  rank: 8
+  alpha: 16
+  target_modules: ["q_proj", "v_proj"]
+
+train:
+  batch_size: 4
+  learning_rate: 2.0e-4
+  optimizer: adamw
+  weight_decay: 0.0
+  dtype: bfloat16
+
+model:
+  kind: open_llama              # dispatch key -> models/open_llama.py (loads from local path)
+  name: open_llama_3b_v2        # switch to open_llama_7b_v2 for the formal run
+  path: ./models/open_llama_3b_v2
+
+dataset:
+  kind: placeholder             # TODO: set once dataset is chosen
+  split_method: iid_uniform
+  path: ""
+
+logging:
+  level: INFO
+
+tensorboard:
+  port: 6006

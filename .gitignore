@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+
+# IDE / 本地工具配置
+.idea/
+.vscode/
+pyrightconfig.json
+
+# Runtime artifacts
+logs/
+output/
+hf-cache/
+
+# OS
+.DS_Store
