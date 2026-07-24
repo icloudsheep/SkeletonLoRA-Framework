@@ -1,0 +1,20 @@
+name: SkeletonLoRA-Framework
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - --index-url https://download.pytorch.org/whl/cu128
+      - --extra-index-url https://pypi.org/simple
+      - torch==2.11.0
+      - numpy
+      - transformers
+      - peft
+      - safetensors
+      - tensorboard
+      - pandas
+      - pyyaml
+      - sentencepiece
+      - protobuf
