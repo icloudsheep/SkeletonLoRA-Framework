@@ -1,6 +1,6 @@
 # SkeletonLoRA-Framework
 
-预留加解密接口的多客户端联邦 LoRA 微调框架。`main.py` 显性编排整套 FedAvg 流程,加解密与聚合逻辑通过三个函数指针注入,替换真加密只改 `main.py` 顶部三段。
+预留加解密接口的多客户端联邦 LoRA 微调框架。`main.py` 显性编排整套联邦流程,加解密与聚合逻辑通过函数指针注入。
 
 ## 特性
 
@@ -32,7 +32,7 @@ python main.py --config configs/smoke.yaml
 | `client/`、`server/` | 黑盒瘦壳,构造时接受业务钩子 |
 | `runtime/` | main 的物理拆分,包含 device / paths / peft / broadcast / train_step / loss / checkpoint |
 | `utils/` | logger、timer、sizeof、svd、safetensors io、CSV / TensorBoard 写入器 |
-| `models/`、`datasets/` | 按 `config.<kind>` 分派;`dummy.*` 是冒烟实现,`open_llama.py` 待接权重 |
+| `models/`、`datasets/` | 按 `config.<kind>` 分派;`dummy.*` 是冒烟实现,`open_llama.py` 从本地路径加载权重 |
 | `configs/` | `smoke.yaml`(冒烟)、`default.yaml`(真跑) |
 | `logs/`、`output/`、`hf-cache/` | 运行时产物,已加入 `.gitignore` |
 | `CLAUDE.md` | 面向 AI 协作者的完整开发文档 |
@@ -43,13 +43,15 @@ python main.py --config configs/smoke.yaml
 打开 `main.py`,顶部这一段就是全部业务逻辑:
 
 ```python
-encrypt_fn = lambda state_dict: state_dict              # 默认恒等,替换为真加密
-decrypt_fn = lambda ciphertext: ciphertext              # 与 encrypt_fn 配对
-aggregate_fn = lambda plaintexts: {...FedAvg...}        # 默认 FedAvg 等权
+encrypt_fn = lambda state_dict, client_id, round_id: state_dict
+decrypt_fn = lambda ciphertext, client_id, round_id: ciphertext
+aggregate_fn = lambda plaintexts, rank: {...}           # 默认乘积 FedAvg 等权
+secure_aggregate_fn = None                              # 可选联合密文聚合
 ```
 
 - `encrypt_fn` 返回类型任意(bytes / dict / 自定义对象)
 - `decrypt_fn` 拿到什么由你自己配对
+- `client_id` / `round_id` 直接传给加解密钩子,便于构造客户端身份与轮次相关标签
 - `aggregate_fn` 拿到的每份 `state_dict` key 与顺序一致(peft 决定)
 
 细节看 [CLAUDE.md](./CLAUDE.md) 的「自定义加解密 / 聚合逻辑」一节,包含 lambda / def / 配置切换三种写法示例。
@@ -63,10 +65,9 @@ aggregate_fn = lambda plaintexts: {...FedAvg...}        # 默认 FedAvg 等权
 
 ## 未完成 / 挂起
 
-1. `models/open_llama.py` 真基座模型加载,等本地 `open_llama_3b_v2 / 7b_v2` 权重就位。
+1. 本地 `open_llama_3b_v2 / 7b_v2` 权重就位。
 2. 真数据集接入,`configs/default.yaml` 的 `dataset.kind` 目前是 `placeholder`。
-3. `runtime/loss.py` 的 `open_llama` 分支,接真数据集时同步补 causal-LM loss。
-4. `evaluate.py` 训练完的跑分入口,`run.sh` 完成后追加评估步骤。
+3. `run.sh` 训练后自动追加 `evaluate.py`。
 
 ## 文档
 

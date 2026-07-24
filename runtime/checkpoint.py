@@ -1,4 +1,4 @@
-"""checkpoint 落盘: 按 lora_A / lora_B 拆两份 safetensors,并维护 final 软链。"""
+"""checkpoint 落盘: 保存 LoRA 权重并维护 final 软链。"""
 
 from pathlib import Path
 from typing import Dict
@@ -14,6 +14,7 @@ def save_round_checkpoint(ckpt_root: Path, rnd: int, aggregated: Dict[str, torch
     b_sd = {k: v for k, v in aggregated.items() if "lora_B" in k}
     save_state_dict_safetensors(a_sd, round_dir / "A.safetensors")
     save_state_dict_safetensors(b_sd, round_dir / "B.safetensors")
+    save_state_dict_safetensors(aggregated, round_dir / "adapter_model.safetensors")
     return round_dir
 
 

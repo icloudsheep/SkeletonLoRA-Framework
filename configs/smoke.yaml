@@ -19,7 +19,7 @@ train:
   learning_rate: 2.0e-4
   optimizer: adamw
   weight_decay: 0.0
-  dtype: float32               # dummy stays fp32; real config switches to bf16
+  dtype: float32               # dummy stays fp32
 
 model:
   kind: dummy                  # dispatch key -> models/dummy.py

@@ -9,21 +9,22 @@ federated:
   local_steps: 50
 
 lora:
-  rank: 8
-  alpha: 16
-  target_modules: ["q_proj", "v_proj"]
+  rank: 4
+  alpha: 8
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
 
 train:
   batch_size: 4
   learning_rate: 2.0e-4
   optimizer: adamw
   weight_decay: 0.0
-  dtype: bfloat16
+  dtype: float32
 
 model:
   kind: open_llama              # dispatch key -> models/open_llama.py (loads from local path)
   name: open_llama_3b_v2        # switch to open_llama_7b_v2 for the formal run
   path: ./models/open_llama_3b_v2
+  dtype: float32
 
 dataset:
   kind: placeholder             # TODO: set once dataset is chosen

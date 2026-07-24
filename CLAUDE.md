@@ -1,6 +1,6 @@
 # SkeletonLoRA-Framework
 
-一个预留加解密接口的多客户端联邦 LoRA 微调框架。`main.py` 显性编排整套 FedAvg 流程,`client` / `server` 是黑盒,只暴露必要的入参出参函数;加解密与聚合的具体逻辑由用户覆盖对应函数体实现。
+一个预留加解密接口的多客户端联邦 LoRA 微调框架。`main.py` 显性编排整套联邦 LoRA 流程,`client` / `server` 是黑盒,只暴露必要的入参出参函数;加解密与聚合的具体逻辑由用户覆盖对应函数体实现。
 
 ## 目录结构
 
@@ -8,7 +8,7 @@
 SkeletonLoRA-Framework/
 ├── main.py                 # 唯一入口,顶部三个 lambda 是全部业务钩子,下面是编排骨架
 ├── run.sh                  # 后台起 tensorboard + 跑训练;trap 清理
-├── evaluate.py             # 待实现,训练完的跑分入口
+├── evaluate.py             # 训练完的跑分入口
 ├── overview.md             # 项目需求文档(与用户逐轮澄清的产物)
 ├── CLAUDE.md               # 本文档
 │
@@ -27,12 +27,12 @@ SkeletonLoRA-Framework/
 │   ├── loss.py             # compute_loss / move_batch
 │   ├── broadcast.py        # 上一轮聚合结果灌回各 adapter
 │   ├── train_step.py       # 一个客户端一整轮本地训练 + 记录
-│   └── checkpoint.py       # 存 round_XX + final 软链
+│   └── checkpoint.py       # 存 round_XX checkpoint + final 软链
 │
 ├── models/
 │   ├── __init__.py         # 按 config.model.kind 分派
 │   ├── dummy.py            # 冒烟用假模型(单层 Linear)
-│   └── open_llama.py       # 真基座模型加载器,占位待实现
+│   └── open_llama.py       # 真基座模型加载器,从本地路径读取权重
 ├── datasets/
 │   ├── __init__.py         # 一次性 build_shards + 每轮 build_dataloader
 │   └── dummy.py            # 冒烟用随机张量数据集
@@ -41,7 +41,8 @@ SkeletonLoRA-Framework/
 │   ├── logger.py           # Python logging 初始化(INFO+ 落控制台,DEBUG 仅落文件)
 │   ├── timer.py            # perf_timer() 上下文管理器
 │   ├── sizeof.py           # sizeof(obj) = len(pickle.dumps(obj))
-│   ├── svd.py              # svd_truncate(state_dict, rank),由 main 在 aggregate 后调
+│   ├── lora_product.py     # aggregate_lora_products(state_dicts, rank)
+│   ├── svd.py              # 通用二维张量 SVD 截断工具
 │   ├── metrics.py          # CsvWriters + TbWriters
 │   └── io.py               # yaml / safetensors / raw bytes IO
 ├── configs/
@@ -56,7 +57,7 @@ SkeletonLoRA-Framework/
 **目录约定**
 
 - `logs/<RUN_ID>/` 与 `output/<RUN_ID>/` 共享同一个 `RUN_ID`(时间戳 `YYYY-MM-DD_HH-MM-SS`,main 启动时算一次)。
-- `output/<RUN_ID>/checkpoints/round_XX/{A.safetensors, B.safetensors}`,`final` 是指向最后一轮的 POSIX 软链。
+- `output/<RUN_ID>/checkpoints/round_XX/{A.safetensors, B.safetensors, adapter_model.safetensors}`,`final` 是指向最后一轮的 POSIX 软链。
 - CSV 三张表全落在 `output/<RUN_ID>/metrics/`:`step.csv`(每 step 一行)、`round.csv`(每 round × client 一行,服务端字段冗余写)、`grad_norm.csv`(长表)。
 
 ## 快速开始
@@ -84,56 +85,56 @@ python main.py --config configs/smoke.yaml
 
 ## 自定义加解密 / 聚合逻辑
 
-框架的三个业务钩子**全部在 `main.py` 顶部**,以函数指针形式作为入参传入 `Client` / `Server`。默认实现是恒等 + FedAvg,保证明文链路可跑通;要接入真加密只改 `main.py` 里的三段代码,其他一律不动。
+框架的业务钩子**全部在 `main.py` 顶部**,以函数指针形式作为入参传入 `Client` / `Server`。默认实现是恒等 + 乘积 FedAvg,保证明文链路可跑通。
 
-### 三个钩子的签名和位置
+### 钩子的签名和位置
 
 打开 `main.py`,顶部这一段就是全部业务逻辑:
 
 ```python
-encrypt_fn = lambda state_dict: state_dict
+encrypt_fn = lambda state_dict, client_id, round_id: state_dict
 
-decrypt_fn = lambda ciphertext: ciphertext
+decrypt_fn = lambda ciphertext, client_id, round_id: ciphertext
 
-aggregate_fn = lambda plaintexts: {
-    k: torch.stack([p[k].float() for p in plaintexts]).mean(dim=0).to(plaintexts[0][k].dtype)
-    for k in plaintexts[0].keys()
-}
+aggregate_fn = lambda plaintexts, rank: aggregate_lora_products(plaintexts, rank=rank)
+
+secure_aggregate_fn = None
 ```
 
 | 钩子 | 签名 | 语义 |
 |---|---|---|
-| `encrypt_fn` | `(Dict[str, Tensor]) -> Any` | 客户端加密。返回类型任意,由 `decrypt_fn` 配对反解。 |
-| `decrypt_fn` | `(Any) -> Dict[str, Tensor]` | 服务端解密。 |
-| `aggregate_fn` | `(List[Dict[str, Tensor]]) -> Dict[str, Tensor]` | 服务端聚合。默认 FedAvg 等权。 |
+| `encrypt_fn` | `(Dict[str, Tensor], int, int) -> Any` | 客户端加密。后两个参数为 `client_id` / `round_id`。 |
+| `decrypt_fn` | `(Any, int, int) -> Dict[str, Tensor]` | 服务端解密。后两个参数为 `client_id` / `round_id`。 |
+| `aggregate_fn` | `(List[Dict[str, Tensor]], int) -> Dict[str, Tensor]` | 服务端明文聚合。默认对 `B @ A` 做等权平均,再分解回 LoRA A/B。 |
+| `secure_aggregate_fn` | `Optional[(List[Tuple[int, Any]], int) -> Dict[str, Tensor]]` | 联合密文聚合。设为 `None` 时走默认解密后聚合。 |
 
 流水线在 `main.py` 里显性写出来:
 
 ```
-client 端:  state_dict  --encrypt_fn-->  ciphertext(Any)
-                                            │  上传到 server
-server 端:  ciphertexts --decrypt_fn-->  plaintexts
-                       --aggregate_fn--> aggregated
-                                            │
-main 里:              --svd_truncate--> downstream {A, B}
-                                            │  下发回每个客户端 adapter
+client 端:  state_dict + client_id + round_id  --encrypt_fn-->  ciphertext(Any)
+                                                               │  上传到 server
+server 端:  ciphertext + client_id + round_id  --decrypt_fn-->  plaintexts
+                                      --aggregate_fn--> downstream {A, B}
+                                                               │  下发回每个客户端 adapter
 ```
 
-**SVD 截断在 main 里显性调用**,不属于 server 内部,保证下发权重的维度与 LoRA rank 一致。
+默认聚合会对客户端 LoRA 乘积做等权平均,再分解成下发所需的 A/B。
 
 ### 三种写法示例
 
 **用 lambda(短逻辑)**
 
 ```python
-encrypt_fn = lambda sd: {k: v.numpy().tobytes() for k, v in sd.items()}
-decrypt_fn = lambda ct: {k: torch.frombuffer(v, dtype=torch.float32).view(shape[k]) for k, v in ct.items()}
+encrypt_fn = lambda sd, client_id, round_id: {k: v.numpy().tobytes() for k, v in sd.items()}
+decrypt_fn = lambda ct, client_id, round_id: {
+    k: torch.frombuffer(v, dtype=torch.float32).view(shape[k]) for k, v in ct.items()
+}
 ```
 
 **用 def(长逻辑,推荐)**
 
 ```python
-def encrypt_fn(state_dict):
+def encrypt_fn(state_dict, client_id, round_id):
     # 例: AES-GCM 对每个张量的 raw bytes 加密
     import io, os
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -147,7 +148,7 @@ def encrypt_fn(state_dict):
         out[k] = {"nonce": nonce, "ct": aead.encrypt(nonce, buf.getvalue(), None)}
     return out
 
-def decrypt_fn(ciphertext):
+def decrypt_fn(ciphertext, client_id, round_id):
     import io
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     key = os.environ["FED_KEY"].encode()
@@ -172,8 +173,9 @@ elif config.get("encryption") == "he":
 ### 接口的自由度说明
 
 - `encrypt_fn` 返回类型是 `Any`,可以是 `bytes` / `dict` / 自定义对象,`decrypt_fn` 拿到什么由自己配对。
+- `client_id` / `round_id` 由框架传入,可直接用于身份相关密钥、标签或轮次隔离。
 - 客户端与服务端之间传递的 `ciphertext` 是原对象,不落盘、不序列化;`main.py` 在 `sizeof(ciphertext)` 时用 `pickle.dumps` 度量大小,这是**大小度量的唯一口径**(明文、密文、下发都用它,可直接比较膨胀比)。
-- **密文域聚合**:如果加密方案支持密文相加(如加法同态),把 `aggregate_fn` 改成对密文列表直接操作,`decrypt_fn` 只处理最终聚合结果。当前 `server.decrypt_aggregate` 固定「先 decrypt 每份、再 aggregate」,要走密文域聚合请告知,server 需要改成对偶顺序。
+- **密文域聚合**:如果加密方案需要联合处理全部密文,实现 `secure_aggregate_fn(ciphertexts, round_id)` 并把它设为非 `None`。
 - `aggregate_fn` 拿到的每份 `state_dict` 的 key 与顺序都一致(peft 决定),可以直接按 key 一一对应。
 
 ### 修改后如何验证
@@ -194,7 +196,7 @@ elif config.get("encryption") == "he":
 | `broadcast.py` | 把上一轮聚合结果灌回每个 adapter |
 | `train_step.py` | 一个客户端一整轮本地训练 + loss / grad_norm 记录 |
 | `loss.py` | 按 model kind 分派的 loss 计算与 batch 迁移 |
-| `checkpoint.py` | 存 round_XX 的 A/B safetensors + final 软链 |
+| `checkpoint.py` | 存 round_XX 的 A/B/adapter_model safetensors + final 软链 |
 
 这些是 main 的物理拆分,不对外暴露语义。业务逻辑只集中在 main 顶部三个函数指针上。
 
@@ -209,16 +211,16 @@ federated:
   local_steps: 50                        # 每客户端每轮本地 step 数
 
 lora:
-  rank: 8                                # LoRA rank(server 的 SVD 截断也用这个值)
-  alpha: 16
-  target_modules: ["q_proj", "v_proj"]   # 挂 LoRA 的模块名(open_llama 沿用 llama 命名)
+  rank: 4                                # LoRA rank
+  alpha: 8
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
 
 train:
   batch_size: 4
   learning_rate: 2.0e-4
   optimizer: adamw
   weight_decay: 0.0
-  dtype: bfloat16                        # 训练精度,dummy 走 float32
+  dtype: float32                         # 训练精度,保持与 C++ 模块兼容
 
 model:
   kind: dummy | open_llama               # 分派到 models/__init__.py
@@ -249,15 +251,13 @@ tensorboard:
 
 **文本日志**:`logs/<RUN>/train.log`,人读用。
 
-**checkpoint**:`output/<RUN>/checkpoints/round_XX/{A,B}.safetensors`,`final` 软链指向最后一轮。
+**checkpoint**:`output/<RUN>/checkpoints/round_XX/{A,B,adapter_model}.safetensors`,`final` 软链指向最后一轮。
 
 ## 未完成 / 挂起
 
-1. **真基座模型加载**:`models/open_llama.py` 目前抛 `NotImplementedError`。等 `openlm-research/open_llama_3b_v2` 与 `open_llama_7b_v2` 的本地权重就位后,补上 `AutoModelForCausalLM.from_pretrained(model_cfg["path"], torch_dtype=bfloat16, local_files_only=True)`。
+1. **本地模型权重**:等 `openlm-research/open_llama_3b_v2` 与 `open_llama_7b_v2` 的本地权重就位。
 2. **真数据集接入**:`configs/default.yaml` 的 `dataset.kind` 是 `placeholder`。选定数据集后新增 `datasets/<name>.py` + 在 `datasets/__init__.py` 的 `build_shards` 里加分支。
-3. **`_compute_loss` 的 `open_llama` 分支**:接真数据集时同步补 causal-LM 的 loss 计算(通常是 `outputs.loss` 直接返回)。
-4. **`evaluate.py`**:训练结束后按 `output/<RUN>/checkpoints/final` 里的权重跑分,结果落 `output/<RUN>/metrics/eval.csv`。
-5. **`run.sh` 追加 evaluate**:evaluate.py 完工后,在 `run.sh` 末尾加 `python evaluate.py --run-id ...`。
+3. **`run.sh` 追加 evaluate**:如需一键训练后评估,在 `run.sh` 末尾加 `python evaluate.py --config ... --run-id ...`。
 
 ## 编码铁律(项目自身遵循的)
 

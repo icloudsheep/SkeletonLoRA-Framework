@@ -8,12 +8,21 @@ def compute_loss(model: torch.nn.Module, batch, kind: str) -> torch.Tensor:
         x, y = batch
         return ((model(x) - y) ** 2).mean()
     if kind == "open_llama":
-        # 占位 [注: 截至 2026-07-20]: 等本地权重与数据集接入后再补 causal-LM 的 loss。
-        raise NotImplementedError("open_llama 的 loss 分支尚未实现")
+        if not isinstance(batch, dict):
+            raise TypeError("open_llama batch 必须是包含 labels 的 dict")
+        outputs = model(**batch)
+        if outputs.loss is None:
+            raise ValueError("open_llama batch 缺少可计算 causal-LM loss 的 labels")
+        return outputs.loss
     raise ValueError(f"未知的 model kind: {kind}")
 
 
 def move_batch(batch, device: torch.device):
+    if isinstance(batch, dict):
+        return {
+            k: v.to(device) if torch.is_tensor(v) else v
+            for k, v in batch.items()
+        }
     if isinstance(batch, (list, tuple)):
         return [b.to(device) if torch.is_tensor(b) else b for b in batch]
     if torch.is_tensor(batch):

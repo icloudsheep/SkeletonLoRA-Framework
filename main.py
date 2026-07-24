@@ -1,9 +1,10 @@
 """联邦 LoRA 微调入口: 极简编排。
 
-用户仅在下方三个 lambda 中填写业务逻辑,其他不动:
-  - encrypt_fn(state_dict) -> ciphertext (Any)
-  - decrypt_fn(ciphertext) -> state_dict
-  - aggregate_fn(list[state_dict]) -> state_dict
+用户仅在下方钩子中填写业务逻辑,其他不动:
+  - encrypt_fn(state_dict, client_id, round_id) -> ciphertext (Any)
+  - decrypt_fn(ciphertext, client_id, round_id) -> state_dict
+  - aggregate_fn(list[state_dict], rank) -> state_dict
+  - secure_aggregate_fn(list[(client_id, ciphertext)], round_id) -> state_dict
 """
 
 from __future__ import annotations
@@ -11,8 +12,6 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 from typing import Optional
-
-import torch
 
 from client import Client
 from datasets import build_shards
@@ -28,21 +27,20 @@ from runtime import (
     train_client_one_round,
 )
 from server import Server
-from utils import CsvWriters, TbWriters, build_logger, load_yaml, perf_timer, sizeof, svd_truncate
+from utils import CsvWriters, TbWriters, aggregate_lora_products, build_logger, load_yaml, perf_timer, sizeof
 
 # ==================== 用户可填的加解密聚合逻辑 ====================
-# 默认为「恒等 + FedAvg 等权」,保证明文链路可跑通;换真加密只改这三段。
+# 默认为「恒等 + 乘积 FedAvg 等权」,保证明文链路可跑通;换真加密只改下方钩子。
 
-# 三处 lambda 是「一屏可读的业务钩子占位」,替换真加密时可换成 def;
+# lambda 是「一屏可读的业务钩子占位」,替换真加密时可换成 def;
 # 静态检查器的 E731(lambda 赋名)在此为设计选择,不修。
-encrypt_fn = lambda state_dict: state_dict  # noqa: E731
+encrypt_fn = lambda state_dict, client_id, round_id: state_dict  # noqa: E731
 
-decrypt_fn = lambda ciphertext: ciphertext  # noqa: E731
+decrypt_fn = lambda ciphertext, client_id, round_id: ciphertext  # noqa: E731
 
-aggregate_fn = lambda plaintexts: {  # noqa: E731
-    k: torch.stack([p[k].float() for p in plaintexts]).mean(dim=0).to(plaintexts[0][k].dtype)
-    for k in plaintexts[0]
-}
+aggregate_fn = lambda plaintexts, rank: aggregate_lora_products(plaintexts, rank=rank)  # noqa: E731
+
+secure_aggregate_fn = None
 
 # =================================================================
 
@@ -69,7 +67,11 @@ def main() -> None:
 
     shards = build_shards(config)
     clients = [Client(client_id=i, encrypt_fn=encrypt_fn) for i in range(num_clients)]
-    server = Server(decrypt_fn=decrypt_fn, aggregate_fn=aggregate_fn)
+    server = Server(
+        decrypt_fn=decrypt_fn,
+        aggregate_fn=lambda plaintexts: aggregate_fn(plaintexts, rank),
+        secure_aggregate_fn=secure_aggregate_fn,
+    )
 
     csv_w = CsvWriters(metrics_dir=paths.metrics_dir)
     tb_w = TbWriters(tb_dir=paths.tb_dir, num_clients=num_clients)
@@ -90,9 +92,9 @@ def main() -> None:
                 config=config, device=device, rnd=rnd, csv_w=csv_w, tb_w=tb_w,
             )
             with perf_timer() as t_enc:
-                ciphertext = c.encrypt(plaintext)
+                ciphertext = c.encrypt(plaintext, c.client_id, rnd)
             p_size, c_size = sizeof(plaintext), sizeof(ciphertext)
-            ciphertexts.append(ciphertext)
+            ciphertexts.append((c.client_id, ciphertext))
             client_rows.append({
                 "round": rnd, "client_id": c.client_id,
                 "encrypt_time": t_enc.value, "plaintext_size": p_size, "ciphertext_size": c_size,
@@ -106,7 +108,7 @@ def main() -> None:
         # 预初始化让静态检查器知道 with 之外 aggregated 一定有值。
         aggregated: dict = {}
         with perf_timer() as t_agg:
-            aggregated = svd_truncate(server.decrypt_aggregate(ciphertexts), rank=rank)
+            aggregated = server.decrypt_aggregate(ciphertexts, rnd)
         aggregated = {k: v.detach().cpu() for k, v in aggregated.items()}
         b_size = sizeof(aggregated)
         logger.info("round %d 聚合完成: 耗时=%.6fs 下发大小=%dB", rnd, t_agg.value, b_size)

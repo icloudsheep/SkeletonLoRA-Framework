@@ -7,6 +7,7 @@ from utils.io import (
     save_bytes,
 )
 from utils.logger import build_logger
+from utils.lora_product import aggregate_lora_products, factorize_lora_product
 from utils.metrics import CsvWriters, TbWriters
 from utils.sizeof import sizeof
 from utils.svd import svd_truncate
@@ -18,6 +19,8 @@ __all__ = [
     "load_state_dict_safetensors",
     "save_bytes",
     "build_logger",
+    "aggregate_lora_products",
+    "factorize_lora_product",
     "CsvWriters",
     "TbWriters",
     "sizeof",
