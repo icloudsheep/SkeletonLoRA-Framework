@@ -12,13 +12,17 @@
 ## 快速开始
 
 ```bash
-# 使用现成的 conda 环境
+# 创建并激活环境
+conda env create -f environment.yaml
 conda activate skeleton_lora_fe
 
 # 一键冒烟(dummy 模型 + dummy 数据集,几秒钟跑完)
 ./run.sh
 
-# 或直接跑
+# 正式训练（需先将本地模型和数据集放到 configs/default.yaml 指定路径）
+./run.sh configs/default.yaml
+
+# 或直接跑冒烟配置
 python main.py --config configs/smoke.yaml
 ```
 
@@ -32,7 +36,7 @@ python main.py --config configs/smoke.yaml
 | `client/`、`server/` | 黑盒瘦壳,构造时接受业务钩子 |
 | `runtime/` | main 的物理拆分,包含 device / paths / peft / broadcast / train_step / loss / checkpoint |
 | `utils/` | logger、timer、sizeof、svd、safetensors io、CSV / TensorBoard 写入器 |
-| `models/`、`datasets/` | 按 `config.<kind>` 分派;`dummy.*` 是冒烟实现,`open_llama.py` 从本地路径加载权重 |
+| `models/`、`datasets/` | 按 `config.<kind>` 分派；支持本地 OpenLLaMA 与 Dolly 15k，`dummy.*` 用于冒烟 |
 | `configs/` | `smoke.yaml`(冒烟)、`default.yaml`(真跑) |
 | `logs/`、`output/`、`hf-cache/` | 运行时产物,已加入 `.gitignore` |
 | `CLAUDE.md` | 面向 AI 协作者的完整开发文档 |
@@ -63,11 +67,13 @@ secure_aggregate_fn = None                              # 可选联合密文聚�
 - 依赖:`torch`、`transformers`、`peft`、`safetensors`、`tensorboard`、`pandas`、`pyyaml`
 - 静态检查:`pyright` 0 error / `ruff` all checks passed(项目根有 `pyrightconfig.json`)
 
-## 未完成 / 挂起
+## 正式训练所需本地资源
 
-1. 本地 `open_llama_3b_v2 / 7b_v2` 权重就位。
-2. 真数据集接入,`configs/default.yaml` 的 `dataset.kind` 目前是 `placeholder`。
-3. `run.sh` 训练后自动追加 `evaluate.py`。
+- `models/open_llama_3b_v2/`：模型配置、权重及 tokenizer 文件。
+- `datasets/databricks-dolly-15k/databricks-dolly-15k.jsonl`：Dolly 15k 原始数据。
+- 上述大文件目录已加入 `.gitignore`，应在训练机器上单独下载。
+
+`run.sh` 训练后自动追加 `evaluate.py` 仍待接入。
 
 ## 文档
 

@@ -1,4 +1,4 @@
-name: SkeletonLoRA-Framework
+name: skeleton_lora_fe
 channels:
   - conda-forge
   - defaults

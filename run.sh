@@ -9,6 +9,7 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 CONFIG="${1:-$ROOT/configs/smoke.yaml}"
 PORT="${TB_PORT:-6006}"
 
+cd "$ROOT"
 export HF_HOME="$ROOT/hf-cache"
 
 TB_LOGDIR="$ROOT/output"

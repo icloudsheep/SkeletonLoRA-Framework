@@ -12,6 +12,7 @@ from typing import List
 import torch
 from torch.utils.data import DataLoader, Dataset
 
+from datasets.dolly import build_dolly_shards
 from datasets.dummy import build_dummy_shards
 
 
@@ -19,6 +20,8 @@ def build_shards(config: dict) -> List[Dataset]:
     kind = config["dataset"]["kind"]
     if kind == "dummy":
         return build_dummy_shards(config)
+    if kind == "dolly_15k":
+        return build_dolly_shards(config)
     raise ValueError(f"未知的 dataset kind: {kind}")
 
 

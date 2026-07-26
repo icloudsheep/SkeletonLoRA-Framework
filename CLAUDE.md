@@ -35,7 +35,8 @@ SkeletonLoRA-Framework/
 │   └── open_llama.py       # 真基座模型加载器,从本地路径读取权重
 ├── datasets/
 │   ├── __init__.py         # 一次性 build_shards + 每轮 build_dataloader
-│   └── dummy.py            # 冒烟用随机张量数据集
+│   ├── dummy.py            # 冒烟用随机张量数据集
+│   └── dolly.py            # Dolly 15k 本地加载、causal-LM 编码与 IID 分片
 ├── utils/
 │   ├── __init__.py         # 统一导出
 │   ├── logger.py           # Python logging 初始化(INFO+ 落控制台,DEBUG 仅落文件)
@@ -47,7 +48,7 @@ SkeletonLoRA-Framework/
 │   └── io.py               # yaml / safetensors / raw bytes IO
 ├── configs/
 │   ├── smoke.yaml          # dummy 模型 + dummy 数据集,macOS CPU/MPS 秒级跑完
-│   └── default.yaml        # 真基座模型 + 真数据集(待接入)
+│   └── default.yaml        # 本地 OpenLLaMA 3B + Databricks Dolly 15k
 │
 ├── logs/                   # <RUN_ID>/train.log,只放人读的文本日志
 ├── output/                 # <RUN_ID>/{checkpoints,metrics,tensorboard},结构化产物
@@ -226,7 +227,9 @@ model:
   kind: dummy | open_llama               # 分派到 models/__init__.py
 
 dataset:
-  kind: dummy | placeholder | ...        # 分派到 datasets/__init__.py
+  kind: dummy | dolly_15k                # 分派到 datasets/__init__.py
+  path: ./datasets/databricks-dolly-15k/databricks-dolly-15k.jsonl
+  max_length: 512                        # Dolly causal-LM 序列长度
   split_method: iid_uniform              # 目前只实现了 iid 均分
 
 logging:
@@ -255,8 +258,8 @@ tensorboard:
 
 ## 未完成 / 挂起
 
-1. **本地模型权重**:等 `openlm-research/open_llama_3b_v2` 与 `open_llama_7b_v2` 的本地权重就位。
-2. **真数据集接入**:`configs/default.yaml` 的 `dataset.kind` 是 `placeholder`。选定数据集后新增 `datasets/<name>.py` + 在 `datasets/__init__.py` 的 `build_shards` 里加分支。
+1. **本地模型权重**:训练机器需单独准备 `openlm-research/open_llama_3b_v2`，正式实验可切换到 `open_llama_7b_v2`。
+2. **真数据集文件**:训练机器需单独准备 `datasets/databricks-dolly-15k/databricks-dolly-15k.jsonl`；代码已实现本地加载、指令模板编码、labels 构造和 `iid_uniform` 分片。
 3. **`run.sh` 追加 evaluate**:如需一键训练后评估,在 `run.sh` 末尾加 `python evaluate.py --config ... --run-id ...`。
 
 ## 编码铁律(项目自身遵循的)

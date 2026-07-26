@@ -1,5 +1,4 @@
-# Default config: real base model + real dataset placeholder.
-# Fill dataset.path and models weight location before running.
+# Default config: local OpenLLaMA 3B + local Databricks Dolly 15k.
 
 seed: 42
 
@@ -27,9 +26,10 @@ model:
   dtype: float32
 
 dataset:
-  kind: placeholder             # TODO: set once dataset is chosen
+  kind: dolly_15k
   split_method: iid_uniform
-  path: ""
+  path: ./datasets/databricks-dolly-15k/databricks-dolly-15k.jsonl
+  max_length: 512
 
 logging:
   level: INFO
