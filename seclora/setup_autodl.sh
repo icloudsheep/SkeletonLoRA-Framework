@@ -4,6 +4,11 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
+# AutoDL images may put the system libstdc++ ahead of Conda's newer runtime.
+if [[ -n "${CONDA_PREFIX:-}" && -d "${CONDA_PREFIX}/lib" ]]; then
+    export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+fi
+
 missing=0
 for command_name in git cmake c++; do
     if ! command -v "${command_name}" >/dev/null 2>&1; then
@@ -32,8 +37,18 @@ EOF
     exit 1
 fi
 
-"${PYTHON_BIN}" -c \
-    'import torch, numpy, yaml, peft; print("framework environment: OK")'
+if ! "${PYTHON_BIN}" -c \
+    'import torch, numpy, yaml, peft; print("framework environment: OK")'; then
+    cat >&2 <<'EOF'
+The framework Python environment is not importable. If the error mentions
+GLIBCXX_3.4.31, install a newer Conda C++ runtime and reactivate the environment:
+  conda install -y -c conda-forge "libstdcxx-ng>=13" "libgcc-ng>=13"
+  conda env config vars set LD_LIBRARY_PATH="$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  conda deactivate
+  conda activate skeleton_lora_fe
+EOF
+    exit 1
+fi
 "${PYTHON_BIN}" -m pip install \
     -r "${ROOT_DIR}/seclora/requirements-native.txt"
 

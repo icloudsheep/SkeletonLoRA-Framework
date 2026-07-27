@@ -106,6 +106,27 @@ After the smoke test passes, start the real OpenLLaMA/Dolly run:
 python main.py --config configs/seclora_end_to_end.yaml
 ```
 
+### AutoDL libstdc++ mismatch
+
+If importing `optree`, Torch, Transformers, or PEFT reports that
+`GLIBCXX_3.4.31` is missing, do not replace or symlink the system library.
+Install the compatible runtime inside the existing Conda environment:
+
+```bash
+conda activate skeleton_lora_fe
+conda install -y -c conda-forge "libstdcxx-ng>=13" "libgcc-ng>=13"
+conda env config vars set \
+  LD_LIBRARY_PATH="$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+conda deactivate
+conda activate skeleton_lora_fe
+```
+
+Verify the repaired framework environment before rebuilding:
+
+```bash
+python -c "import optree, torch, transformers, peft; print('imports: OK')"
+```
+
 The build script pins herumi/mcl to commit `7af8ea7`. Set `PYTHON_BIN` when the
 active interpreter is not named `python`, or `SECLORA_MCL_DIR` to reuse an
 existing checkout at that exact revision.

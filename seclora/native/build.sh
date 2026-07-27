@@ -6,6 +6,10 @@ MCL_DIR="${SECLORA_MCL_DIR:-${NATIVE_DIR}/third_party/mcl}"
 MCL_COMMIT="7af8ea79d240d24f24c8fb049c0bcd74464d677b"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
+if [[ -n "${CONDA_PREFIX:-}" && -d "${CONDA_PREFIX}/lib" ]]; then
+    export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+fi
+
 if [[ "${1:-}" == "clean" ]]; then
     rm -rf "${NATIVE_DIR}/build"
     rm -f "${NATIVE_DIR}"/_seclora_native*.so
