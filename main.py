@@ -24,9 +24,9 @@ from runtime import (
     prepare_run_paths,
     save_round_checkpoint,
     seed_all,
-    train_client_one_round,
 )
 from server import Server
+from training_progress import train_client_one_round
 from utils import CsvWriters, TbWriters, aggregate_lora_products, build_logger, load_yaml, perf_timer, sizeof
 
 # ==================== 用户可填的加解密聚合逻辑 ====================
@@ -90,6 +90,7 @@ def main() -> None:
             plaintext = train_client_one_round(
                 model=model, client=c, shard=shards[c.client_id],
                 config=config, device=device, rnd=rnd, csv_w=csv_w, tb_w=tb_w,
+                logger=logger,
             )
             with perf_timer() as t_enc:
                 ciphertext = c.encrypt(plaintext, c.client_id, rnd)
