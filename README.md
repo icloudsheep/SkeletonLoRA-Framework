@@ -28,6 +28,23 @@ python main.py --config configs/smoke.yaml
 
 产物在 `output/<时间戳>/`,人读日志在 `logs/<时间戳>/train.log`。
 
+### SecLoRA SEL-2S
+
+`SecLoRA_EndToEnd` 分支新增了独立的 `seclora/` 模块，不改动共享的
+`client/`、`server/`、`runtime/` 和 `utils/`。在训练环境中执行：
+
+```bash
+conda activate skeleton_lora_fe
+bash seclora/setup_autodl.sh
+bash seclora/verify_autodl.sh
+python main.py --config configs/seclora_end_to_end.yaml
+```
+
+配置默认使用 4 客户端、10% 选择性加密、`Sfp=22`、`Xmax=0.03125` 和
+48 线程。原生后端复用全局 PC-MCFE 参数、聚合密钥和 BSGS 表，每轮返回
+`C/M/S` 骨架并压回配置的 LoRA rank。协议边界与当前限制见
+[seclora/README.md](./seclora/README.md)。
+
 ## 目录索引
 
 | 目录 / 文件 | 用途 |
@@ -38,6 +55,7 @@ python main.py --config configs/smoke.yaml
 | `utils/` | logger、timer、sizeof、svd、safetensors io、CSV / TensorBoard 写入器 |
 | `models/`、`datasets/` | 按 `config.<kind>` 分派；支持本地 OpenLLaMA 与 Dolly 15k，`dummy.*` 用于冒烟 |
 | `configs/` | `smoke.yaml`(冒烟)、`default.yaml`(真跑) |
+| `seclora/` | SecLoRA 分支独立模块：Python 适配、PC-MCFE 原生后端和 CUR 解码 |
 | `logs/`、`output/`、`hf-cache/` | 运行时产物,已加入 `.gitignore` |
 | `CLAUDE.md` | 面向 AI 协作者的完整开发文档 |
 | `overview.md` | 项目需求文档,与用户逐轮澄清的产物 |

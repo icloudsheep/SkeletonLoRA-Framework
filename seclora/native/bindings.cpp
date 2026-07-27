@@ -1,0 +1,159 @@
+#include <memory>
+#include <stdexcept>
+#include <vector>
+
+#include <pybind11/numpy.h>
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
+
+#include "session.h"
+
+namespace py = pybind11;
+
+namespace {
+
+FloatLayerInput parse_layer(const py::dict& value) {
+    FloatLayerInput layer;
+    layer.layer_id = py::cast<int>(value["layer_id"]);
+    if (value.contains(py::str("name"))) {
+        layer.name = py::cast<std::string>(value["name"]);
+    }
+
+    using FloatArray =
+        py::array_t<float, py::array::c_style | py::array::forcecast>;
+    FloatArray a = FloatArray::ensure(value["a"]);
+    FloatArray b = FloatArray::ensure(value["b"]);
+    if (!a || !b || a.ndim() != 2 || b.ndim() != 2 ||
+        a.shape(0) != b.shape(1)) {
+        throw std::invalid_argument(
+            "native layer expects A=(rank, cols), B=(rows, rank)");
+    }
+
+    layer.rows = static_cast<int>(b.shape(0));
+    layer.cols = static_cast<int>(a.shape(1));
+    const float* a_data = a.data();
+    const float* b_data = b.data();
+    layer.a.assign(a_data, a_data + a.size());
+    layer.b.assign(b_data, b_data + b.size());
+    return layer;
+}
+
+py::array_t<long long> matrix_array(
+    const std::vector<std::vector<long long>>& matrix,
+    std::size_t empty_cols = 0) {
+    const py::ssize_t rows = static_cast<py::ssize_t>(matrix.size());
+    const py::ssize_t cols = rows > 0
+        ? static_cast<py::ssize_t>(matrix.front().size())
+        : static_cast<py::ssize_t>(empty_cols);
+    py::array_t<long long> result({rows, cols});
+    auto view = result.mutable_unchecked<2>();
+    for (py::ssize_t row = 0; row < rows; ++row) {
+        if (static_cast<py::ssize_t>(matrix[row].size()) != cols) {
+            throw std::runtime_error("native matrix is ragged");
+        }
+        for (py::ssize_t col = 0; col < cols; ++col) {
+            view(row, col) = matrix[row][col];
+        }
+    }
+    return result;
+}
+
+}  // namespace
+
+PYBIND11_MODULE(_seclora_native, module) {
+    module.doc() = "Persistent PC-MCFE SEL-2S backend for SkeletonLoRA";
+
+    py::class_<NativeClientUpdate, std::shared_ptr<NativeClientUpdate>>(
+        module, "NativeClientUpdate")
+        .def_property_readonly(
+            "client_id", [](const NativeClientUpdate& value) {
+                return value.client_id;
+            })
+        .def_property_readonly(
+            "round_id", [](const NativeClientUpdate& value) {
+                return value.round_id;
+            })
+        .def_property_readonly(
+            "serialized_size_bytes", [](const NativeClientUpdate& value) {
+                return value.serialized_size_bytes;
+            });
+
+    py::class_<NativeLayerSkeleton>(module, "NativeLayerSkeleton")
+        .def_property_readonly(
+            "layer_id", [](const NativeLayerSkeleton& value) {
+                return value.layer_id;
+            })
+        .def_property_readonly(
+            "c", [](const NativeLayerSkeleton& value) {
+                const std::size_t rank =
+                    value.m.empty() ? 0 : value.m.front().size();
+                return matrix_array(value.c, rank);
+            })
+        .def_property_readonly(
+            "m", [](const NativeLayerSkeleton& value) {
+                return matrix_array(value.m, value.m.size());
+            })
+        .def_property_readonly(
+            "s", [](const NativeLayerSkeleton& value) {
+                return matrix_array(value.s, value.cols);
+            });
+
+    py::class_<SelectiveTwoServerSession>(
+        module, "SelectiveTwoServerSession")
+        .def(
+            py::init([](int num_clients, int rank, double ratio,
+                        int sfp, double xmax, int threads) {
+                py::gil_scoped_release release;
+                return std::unique_ptr<SelectiveTwoServerSession>(
+                    new SelectiveTwoServerSession(
+                        num_clients, rank, ratio, sfp, xmax, threads));
+            }),
+            py::arg("num_clients"),
+            py::arg("rank"),
+            py::arg("ratio"),
+            py::arg("sfp"),
+            py::arg("xmax"),
+            py::arg("threads"))
+        .def(
+            "encrypt_client",
+            [](SelectiveTwoServerSession& session,
+               int client_id, int round_id, const py::list& layers) {
+                std::vector<FloatLayerInput> parsed;
+                parsed.reserve(layers.size());
+                for (const py::handle& item : layers) {
+                    parsed.push_back(parse_layer(py::cast<py::dict>(item)));
+                }
+                py::gil_scoped_release release;
+                return session.encrypt_client(client_id, round_id, parsed);
+            },
+            py::arg("client_id"),
+            py::arg("round_id"),
+            py::arg("layers"))
+        .def(
+            "aggregate_round",
+            [](SelectiveTwoServerSession& session,
+               int round_id,
+               const std::vector<std::shared_ptr<NativeClientUpdate>>& updates) {
+                py::gil_scoped_release release;
+                return session.aggregate_round(round_id, updates);
+            },
+            py::arg("round_id"),
+            py::arg("updates"))
+        .def("close", &SelectiveTwoServerSession::close);
+
+    module.def(
+        "create_session",
+        [](int num_clients, int rank, double ratio,
+           int sfp, double xmax, int threads) {
+            py::gil_scoped_release release;
+            return std::unique_ptr<SelectiveTwoServerSession>(
+                new SelectiveTwoServerSession(
+                    num_clients, rank, ratio, sfp, xmax, threads));
+        },
+        py::arg("num_clients"),
+        py::arg("rank"),
+        py::arg("ratio"),
+        py::arg("sfp"),
+        py::arg("xmax"),
+        py::arg("threads"));
+}

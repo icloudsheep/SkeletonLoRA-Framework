@@ -25,6 +25,7 @@ from runtime import (
     save_round_checkpoint,
     seed_all,
 )
+from seclora import build_seclora_backend
 from server import Server
 from training_progress import train_client_one_round
 from utils import CsvWriters, TbWriters, aggregate_lora_products, build_logger, load_yaml, perf_timer, sizeof
@@ -61,16 +62,35 @@ def main() -> None:
     num_clients = config["federated"]["num_clients"]
     num_rounds = config["federated"]["num_rounds"]
     rank = config["lora"]["rank"]
+    seclora_backend = build_seclora_backend(
+        config,
+        num_clients=num_clients,
+        rank=rank,
+        metrics_dir=paths.metrics_dir,
+    )
+    active_encrypt_fn = seclora_backend.encrypt if seclora_backend else encrypt_fn
+    active_secure_aggregate_fn = (
+        seclora_backend.secure_aggregate
+        if seclora_backend
+        else secure_aggregate_fn
+    )
+    logger.info(
+        "聚合后端: %s",
+        "SecLoRA SEL-2S" if seclora_backend else "plaintext product FedAvg",
+    )
 
     model = build_peft_model(build_model(config["model"]), num_clients, config["lora"]).to(device)
     logger.info("模型就绪: kind=%s num_adapters=%d", config["model"]["kind"], num_clients)
 
     shards = build_shards(config)
-    clients = [Client(client_id=i, encrypt_fn=encrypt_fn) for i in range(num_clients)]
+    clients = [
+        Client(client_id=i, encrypt_fn=active_encrypt_fn)
+        for i in range(num_clients)
+    ]
     server = Server(
         decrypt_fn=decrypt_fn,
         aggregate_fn=lambda plaintexts: aggregate_fn(plaintexts, rank),
-        secure_aggregate_fn=secure_aggregate_fn,
+        secure_aggregate_fn=active_secure_aggregate_fn,
     )
 
     csv_w = CsvWriters(metrics_dir=paths.metrics_dir)
@@ -94,7 +114,12 @@ def main() -> None:
             )
             with perf_timer() as t_enc:
                 ciphertext = c.encrypt(plaintext, c.client_id, rnd)
-            p_size, c_size = sizeof(plaintext), sizeof(ciphertext)
+            p_size = sizeof(plaintext)
+            c_size = (
+                seclora_backend.ciphertext_size(ciphertext)
+                if seclora_backend
+                else sizeof(ciphertext)
+            )
             ciphertexts.append((c.client_id, ciphertext))
             client_rows.append({
                 "round": rnd, "client_id": c.client_id,
@@ -127,6 +152,8 @@ def main() -> None:
     link_final(paths.ckpt_root, num_rounds)
     csv_w.close()
     tb_w.close()
+    if seclora_backend:
+        seclora_backend.close()
     logger.info("run %s 全部完成", paths.run_id)
 
 

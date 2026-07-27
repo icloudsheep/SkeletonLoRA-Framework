@@ -1,0 +1,45 @@
+# End-to-end SecLoRA regression with the repository's dummy model and dataset.
+
+seed: 42
+
+federated:
+  num_clients: 2
+  num_rounds: 1
+  local_steps: 2
+
+lora:
+  rank: 2
+  alpha: 4
+  target_modules: ["linear"]
+
+train:
+  batch_size: 4
+  learning_rate: 2.0e-4
+  optimizer: adamw
+  weight_decay: 0.0
+  dtype: float32
+
+model:
+  kind: dummy
+  hidden_size: 16
+
+dataset:
+  kind: dummy
+  split_method: iid_uniform
+  num_samples: 32
+  input_dim: 16
+  output_dim: 16
+
+secure_aggregation:
+  backend: seclora
+  mode: sel-2s
+  ratio: 0.25
+  sfp: 8
+  xmax: 1.0
+  threads: 4
+
+logging:
+  level: INFO
+
+tensorboard:
+  port: 6006
