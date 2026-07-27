@@ -53,10 +53,16 @@ std::pair<std::vector<int>, std::vector<int>> select_square_pivots(
     const Cell& cell) {
     const int rows = static_cast<int>(row_candidates.size());
     const int cols = static_cast<int>(col_candidates.size());
-    FrMat work(rows, std::vector<Fr>(cols));
+    // Complete pivoting keeps every prefix invertible over Fr while preferring
+    // a numerically stable real-valued skeleton core.
+    FrMat field_work(rows, std::vector<Fr>(cols));
+    RealMat real_work(rows, std::vector<Real>(cols));
     for (int i = 0; i < rows; ++i) {
         for (int j = 0; j < cols; ++j) {
-            work[i][j] = ll_to_fr(cell(row_candidates[i], col_candidates[j]));
+            const long long value =
+                cell(row_candidates[i], col_candidates[j]);
+            field_work[i][j] = ll_to_fr(value);
+            real_work[i][j] = static_cast<Real>(value);
         }
     }
 
@@ -67,31 +73,43 @@ std::pair<std::vector<int>, std::vector<int>> select_square_pivots(
     while (rank < limit) {
         int selected_row = -1;
         int selected_col = -1;
-        for (int i = rank; i < rows && selected_row < 0; ++i) {
+        Real selected_magnitude = -1;
+        for (int i = rank; i < rows; ++i) {
             for (int j = rank; j < cols; ++j) {
-                if (!work[i][j].isZero()) {
+                if (!field_work[i][j].isZero() &&
+                    std::fabs(real_work[i][j]) > selected_magnitude) {
                     selected_row = i;
                     selected_col = j;
-                    break;
+                    selected_magnitude = std::fabs(real_work[i][j]);
                 }
             }
         }
         if (selected_row < 0) break;
 
-        std::swap(work[rank], work[selected_row]);
+        std::swap(field_work[rank], field_work[selected_row]);
+        std::swap(real_work[rank], real_work[selected_row]);
         std::swap(row_ids[rank], row_ids[selected_row]);
         for (int i = 0; i < rows; ++i) {
-            std::swap(work[i][rank], work[i][selected_col]);
+            std::swap(field_work[i][rank], field_work[i][selected_col]);
+            std::swap(real_work[i][rank], real_work[i][selected_col]);
         }
         std::swap(col_ids[rank], col_ids[selected_col]);
 
-        Fr inverse;
-        Fr::inv(inverse, work[rank][rank]);
+        Fr field_inverse;
+        Fr::inv(field_inverse, field_work[rank][rank]);
+        const Real real_pivot = real_work[rank][rank];
         for (int i = rank + 1; i < rows; ++i) {
-            if (work[i][rank].isZero()) continue;
-            Fr factor = work[i][rank] * inverse;
+            if (!field_work[i][rank].isZero()) {
+                const Fr factor = field_work[i][rank] * field_inverse;
+                for (int j = rank; j < cols; ++j) {
+                    field_work[i][j] -=
+                        factor * field_work[rank][j];
+                }
+            }
+            if (real_pivot == 0 || real_work[i][rank] == 0) continue;
+            const Real factor = real_work[i][rank] / real_pivot;
             for (int j = rank; j < cols; ++j) {
-                work[i][j] -= factor * work[rank][j];
+                real_work[i][j] -= factor * real_work[rank][j];
             }
         }
         ++rank;
@@ -630,6 +648,7 @@ SelectiveTwoServerSession::aggregate_round(
         int previous_rank = 0;
         int baseline_checks = 0;
         std::size_t decrypted_cells = 0;
+        std::fprintf(stderr, "\n");
         for (int current_rank = rank_;
              current_rank <= available_rank;
              ++current_rank) {
@@ -767,7 +786,7 @@ SelectiveTwoServerSession::aggregate_round(
             verified = relative_error <= kBaselineRelativeTolerance;
             std::fprintf(
                 stderr,
-                "\n[SecLoRA] layer %d rank %d baseline error %.3Le %s",
+                "[SecLoRA] layer %d rank %d baseline error %.3Le %s\n",
                 first.layer_id, current_rank,
                 relative_error,
                 verified ? "PASS" : "FAIL");

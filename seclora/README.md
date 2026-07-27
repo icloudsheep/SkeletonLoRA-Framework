@@ -32,9 +32,12 @@ is intentionally preserved.
 - `S_D` receives only PC-MCFE objects for the protected prefix and the public
   pivot candidate pool.
 - The candidate pool contains at most `2*K*R` deterministic, spread-out rows
-  and columns from the clear region. Gaussian pivoting over this public block
-  produces nested nonsingular row/column choices; it is not used to estimate
-  the rank of the complete plaintext block.
+  and columns from the clear region. Complete pivoting over this public block
+  requires every pivot to be nonzero in the protocol field and chooses the
+  largest remaining real Schur-complement entry. This produces nested,
+  nonsingular row/column choices while avoiding needlessly ill-conditioned
+  skeleton cores. It is not used to estimate the rank of the complete
+  plaintext block.
 - Skeleton search starts at the configured LoRA rank `R` and increases one rank
   at a time, up to `K*R`. Previously decrypted entries are cached. Increasing
   the rank by one therefore adds only one C column and one S row, including
