@@ -37,7 +37,7 @@ secure_aggregation:
   ratio: 0.10
   sfp: 22
   xmax: 0.03125
-  threads: 48
+  threads: 25
 
 logging:
   level: INFO
