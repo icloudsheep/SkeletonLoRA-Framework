@@ -100,7 +100,10 @@ PYBIND11_MODULE(_seclora_native, module) {
         .def_readonly(
             "selected_rank", &NativeLayerSkeleton::selected_rank)
         .def_readonly(
-            "projection_checks", &NativeLayerSkeleton::projection_checks)
+            "baseline_checks", &NativeLayerSkeleton::baseline_checks)
+        .def_readonly(
+            "baseline_relative_error",
+            &NativeLayerSkeleton::baseline_relative_error)
         .def_readonly(
             "decrypted_cells", &NativeLayerSkeleton::decrypted_cells);
 

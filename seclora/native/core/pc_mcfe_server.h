@@ -65,9 +65,6 @@ public:
         const std::vector<mcl::bn::Fr>& p_weights,
         const std::pair<std::vector<mcl::bn::Fr>, mcl::bn::Fr>& dk_d,
         int layer_id, int pos_y, int round_q, int u, int v);
-    bool group_encodes(
-        const mcl::bn::GT& encoded,
-        const mcl::bn::Fr& exponent) const;
     int decrypt_one_cell_timed(
         const std::vector<std::vector<A_Ciphertext_Slot>>& all_A_cts,
         const std::vector<std::vector<B_SecretKey_Slot>>& all_B_sks,

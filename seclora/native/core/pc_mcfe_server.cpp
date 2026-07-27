@@ -180,13 +180,6 @@ GT PC_MCFE_Server::eval_one_cell_group_refs(
     return v_group;
 }
 
-bool PC_MCFE_Server::group_encodes(
-    const GT& encoded, const Fr& exponent) const {
-    GT expected;
-    GT::pow(expected, base_gt_, exponent);
-    return expected == encoded;
-}
-
 int PC_MCFE_Server::decrypt_one_cell_timed(
     const std::vector<std::vector<A_Ciphertext_Slot>>& all_A_cts,
     const std::vector<std::vector<B_SecretKey_Slot>>& all_B_sks,

@@ -37,10 +37,6 @@ struct NativeLayerUpload {
     // S_D package: unselected slots remain unused.
     std::vector<A_Ciphertext_Slot> encrypted_a;
     std::vector<B_SecretKey_Slot> encrypted_b;
-
-    // One compressed PC-DMCFE pair for beta^T * DeltaW * alpha.
-    std::vector<A_Ciphertext_Slot> projection_a;
-    std::vector<B_SecretKey_Slot> projection_b;
     std::size_t serialized_size_bytes = 0;
 };
 
@@ -59,7 +55,8 @@ struct NativeLayerSkeleton {
     std::vector<std::vector<long long>> m;
     std::vector<std::vector<long long>> s;
     int selected_rank = 0;
-    int projection_checks = 0;
+    int baseline_checks = 0;
+    double baseline_relative_error = 0.0;
     std::size_t decrypted_cells = 0;
 };
 
@@ -95,13 +92,14 @@ private:
     std::vector<mcl::bn::Fr> weights_;
     std::pair<std::vector<mcl::bn::Fr>, mcl::bn::Fr> aggregate_key_;
 
-    struct ProjectionChallenge {
+    struct PlaintextOracleLayer {
         int rows = 0;
         int cols = 0;
-        std::vector<mcl::bn::Fr> alpha;
-        std::vector<mcl::bn::Fr> beta;
+        std::vector<unsigned char> present;
+        std::vector<std::vector<std::vector<long long>>> client_a;
+        std::vector<std::vector<std::vector<long long>>> client_b;
     };
-    std::map<std::pair<int, int>, ProjectionChallenge> projection_challenges_;
+    std::map<std::pair<int, int>, PlaintextOracleLayer> plaintext_oracles_;
 
     void require_open() const;
     std::vector<std::vector<long long>> quantize_a(

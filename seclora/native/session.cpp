@@ -14,8 +14,12 @@
 using namespace mcl::bn;
 using IntMat = std::vector<std::vector<long long>>;
 using FrMat = std::vector<std::vector<Fr>>;
+using Real = long double;
+using RealMat = std::vector<std::vector<Real>>;
 
 namespace {
+
+constexpr Real kBaselineRelativeTolerance = 1e-8L;
 
 template <class F>
 void parallel_for(int count, int threads, const F& fn) {
@@ -98,39 +102,71 @@ std::pair<std::vector<int>, std::vector<int>> select_square_pivots(
     return std::make_pair(std::move(row_ids), std::move(col_ids));
 }
 
-std::vector<Fr> solve_nonsingular(FrMat matrix, std::vector<Fr> rhs) {
-    const int rank = static_cast<int>(matrix.size());
-    if (static_cast<int>(rhs.size()) != rank) {
-        throw std::invalid_argument("finite-field solve dimension mismatch");
+RealMat solve_nonsingular_real(
+    const IntMat& matrix_values,
+    const IntMat& rhs_values,
+    int rank,
+    int cols) {
+    RealMat matrix(rank, std::vector<Real>(rank));
+    RealMat rhs(rank, std::vector<Real>(cols));
+    for (int row = 0; row < rank; ++row) {
+        for (int col = 0; col < rank; ++col) {
+            matrix[row][col] =
+                static_cast<Real>(matrix_values[row][col]);
+        }
+        for (int col = 0; col < cols; ++col) {
+            rhs[row][col] =
+                static_cast<Real>(rhs_values[row][col]);
+        }
     }
+
     for (int col = 0; col < rank; ++col) {
         int pivot = col;
-        while (pivot < rank && matrix[pivot][col].isZero()) ++pivot;
-        if (pivot == rank) {
-            throw std::runtime_error("selected skeleton core is singular");
+        for (int row = col + 1; row < rank; ++row) {
+            if (std::fabs(matrix[row][col]) >
+                std::fabs(matrix[pivot][col])) {
+                pivot = row;
+            }
+        }
+        if (matrix[pivot][col] == 0) {
+            throw std::runtime_error(
+                "selected skeleton core is singular over the reals");
         }
         if (pivot != col) {
             std::swap(matrix[pivot], matrix[col]);
             std::swap(rhs[pivot], rhs[col]);
         }
 
-        Fr inverse;
-        Fr::inv(inverse, matrix[col][col]);
+        const Real inverse = 1 / matrix[col][col];
         for (int next = col; next < rank; ++next) {
             matrix[col][next] *= inverse;
         }
-        rhs[col] *= inverse;
+        for (int rhs_col = 0; rhs_col < cols; ++rhs_col) {
+            rhs[col][rhs_col] *= inverse;
+        }
 
         for (int row = 0; row < rank; ++row) {
-            if (row == col || matrix[row][col].isZero()) continue;
-            const Fr factor = matrix[row][col];
+            if (row == col || matrix[row][col] == 0) continue;
+            const Real factor = matrix[row][col];
             for (int next = col; next < rank; ++next) {
                 matrix[row][next] -= factor * matrix[col][next];
             }
-            rhs[row] -= factor * rhs[col];
+            for (int rhs_col = 0; rhs_col < cols; ++rhs_col) {
+                rhs[row][rhs_col] -= factor * rhs[col][rhs_col];
+            }
         }
     }
     return rhs;
+}
+
+Real gram_product_sum(const RealMat& left, const RealMat& right) {
+    Real result = 0;
+    for (std::size_t row = 0; row < left.size(); ++row) {
+        for (std::size_t col = 0; col < left[row].size(); ++col) {
+            result += left[row][col] * right[row][col];
+        }
+    }
+    return result;
 }
 
 uint64_t mix_index(uint64_t value) {
@@ -315,26 +351,29 @@ SelectiveTwoServerSession::encrypt_client(
         const int eb = static_cast<int>(ratio_ * layer.rows);
         const int ea = static_cast<int>(ratio_ * layer.cols);
         const int candidate_count = 2 * num_clients_ * rank_;
-        const auto challenge_key =
+        const auto oracle_key =
             std::make_pair(round_id, layer.layer_id);
-        auto challenge_it = projection_challenges_.find(challenge_key);
-        if (challenge_it == projection_challenges_.end()) {
-            ProjectionChallenge challenge;
-            challenge.rows = layer.rows;
-            challenge.cols = layer.cols;
-            challenge.alpha.resize(layer.cols);
-            challenge.beta.resize(layer.rows);
-            for (auto& value : challenge.alpha) value.setByCSPRNG();
-            for (auto& value : challenge.beta) value.setByCSPRNG();
-            challenge_it = projection_challenges_
-                .emplace(challenge_key, std::move(challenge)).first;
+        auto oracle_it = plaintext_oracles_.find(oracle_key);
+        if (oracle_it == plaintext_oracles_.end()) {
+            PlaintextOracleLayer oracle;
+            oracle.rows = layer.rows;
+            oracle.cols = layer.cols;
+            oracle.present.assign(num_clients_, 0);
+            oracle.client_a.resize(num_clients_);
+            oracle.client_b.resize(num_clients_);
+            oracle_it = plaintext_oracles_
+                .emplace(oracle_key, std::move(oracle)).first;
         } else if (
-            challenge_it->second.rows != layer.rows ||
-            challenge_it->second.cols != layer.cols) {
+            oracle_it->second.rows != layer.rows ||
+            oracle_it->second.cols != layer.cols) {
             throw std::invalid_argument(
-                "layer id reused with different projection dimensions");
+                "layer id reused with different oracle dimensions");
         }
-        const ProjectionChallenge& challenge = challenge_it->second;
+        PlaintextOracleLayer& oracle = oracle_it->second;
+        if (oracle.present[client_id]) {
+            throw std::invalid_argument(
+                "client submitted the same layer twice in one round");
+        }
 
         NativeLayerUpload payload;
         payload.layer_id = layer.layer_id;
@@ -400,35 +439,9 @@ SelectiveTwoServerSession::encrypt_client(
         }
         client.ClearEncryptionPrecompute();
 
-        std::vector<std::vector<Fr>> projected_a(
-            rank_, std::vector<Fr>(1, Fr(0)));
-        std::vector<std::vector<Fr>> projected_b(
-            1, std::vector<Fr>(rank_, Fr(0)));
-        for (int k = 0; k < rank_; ++k) {
-            for (int col = 0; col < layer.cols; ++col) {
-                projected_a[k][0] +=
-                    ll_to_fr(a[k][col]) * challenge.alpha[col];
-            }
-            for (int row = 0; row < layer.rows; ++row) {
-                projected_b[0][k] +=
-                    challenge.beta[row] * ll_to_fr(b[row][k]);
-            }
-        }
-        client.SetLoraMatricesFr(projected_a, projected_b);
-        try {
-            client.precompute_encA_indices_mt(
-                layer.layer_id, 1, round_id, 1, {0}, threads_);
-            client.precompute_encB_indices_mt(
-                layer.layer_id, 1, round_id, 1, {0}, threads_);
-            payload.projection_a = client.encA_indices_mt(
-                layer.layer_id, 1, round_id, 1, {0}, threads_);
-            payload.projection_b = client.encB_indices_mt(
-                layer.layer_id, 1, round_id, 1, {0}, threads_);
-        } catch (...) {
-            client.ClearEncryptionPrecompute();
-            throw;
-        }
-        client.ClearEncryptionPrecompute();
+        oracle.client_a[client_id] = a;
+        oracle.client_b[client_id] = b;
+        oracle.present[client_id] = 1;
 
         payload.serialized_size_bytes =
             (static_cast<std::size_t>(layer.rows - eb) * rank_ +
@@ -440,8 +453,6 @@ SelectiveTwoServerSession::encrypt_client(
         for (int row : encrypted_rows) {
             payload.serialized_size_bytes += b_slot_bytes(payload.encrypted_b[row]);
         }
-        payload.serialized_size_bytes += a_slot_bytes(payload.projection_a[0]);
-        payload.serialized_size_bytes += b_slot_bytes(payload.projection_b[0]);
         update->serialized_size_bytes += payload.serialized_size_bytes;
         update->layers.push_back(std::move(payload));
     }
@@ -534,39 +545,70 @@ SelectiveTwoServerSession::aggregate_round(
         const std::vector<int>& pivot_cols = candidate_pivots.second;
         const int available_rank = static_cast<int>(pivot_rows.size());
 
-        std::vector<const std::vector<A_Ciphertext_Slot>*> a_refs;
-        std::vector<const std::vector<B_SecretKey_Slot>*> b_refs;
-        std::vector<const std::vector<A_Ciphertext_Slot>*> projection_a_refs;
-        std::vector<const std::vector<B_SecretKey_Slot>*> projection_b_refs;
-        a_refs.reserve(num_clients_);
-        b_refs.reserve(num_clients_);
-        projection_a_refs.reserve(num_clients_);
-        projection_b_refs.reserve(num_clients_);
-        for (const auto* update : ordered) {
-            const NativeLayerUpload& layer = update->layers[layer_index];
-            if (layer.projection_a.size() != 1 ||
-                layer.projection_b.size() != 1) {
-                throw std::invalid_argument(
-                    "client update is missing its projection ciphertext");
-            }
-            a_refs.push_back(&layer.encrypted_a);
-            b_refs.push_back(&layer.encrypted_b);
-            projection_a_refs.push_back(&layer.projection_a);
-            projection_b_refs.push_back(&layer.projection_b);
+        const auto oracle_key =
+            std::make_pair(round_id, first.layer_id);
+        const auto oracle_it = plaintext_oracles_.find(oracle_key);
+        if (oracle_it == plaintext_oracles_.end()) {
+            throw std::runtime_error(
+                "plaintext evaluation oracle is unavailable for this layer");
+        }
+        const PlaintextOracleLayer& oracle = oracle_it->second;
+        if (std::find(
+                oracle.present.begin(), oracle.present.end(),
+                static_cast<unsigned char>(0)) != oracle.present.end()) {
+            throw std::runtime_error(
+                "plaintext evaluation oracle is missing a client update");
         }
 
-        const auto challenge_key =
-            std::make_pair(round_id, first.layer_id);
-        const auto challenge_it =
-            projection_challenges_.find(challenge_key);
-        if (challenge_it == projection_challenges_.end()) {
-            throw std::runtime_error(
-                "projection challenge is unavailable for this layer");
+        const int factor_width = num_clients_ * rank_;
+        auto oracle_b = [&](int row, int component) -> Real {
+            const int client = component / rank_;
+            const int k = component % rank_;
+            return static_cast<Real>(oracle.client_b[client][row][k]);
+        };
+        auto oracle_a = [&](int component, int col) -> Real {
+            const int client = component / rank_;
+            const int k = component % rank_;
+            return static_cast<Real>(oracle.client_a[client][k][col]);
+        };
+
+        RealMat btb(
+            factor_width, std::vector<Real>(factor_width, 0));
+        RealMat aat(
+            factor_width, std::vector<Real>(factor_width, 0));
+        for (int row = 0; row < rows; ++row) {
+            for (int left = 0; left < factor_width; ++left) {
+                const Real value = oracle_b(row, left);
+                for (int right = 0; right < factor_width; ++right) {
+                    btb[left][right] +=
+                        value * oracle_b(row, right);
+                }
+            }
         }
-        const ProjectionChallenge& challenge = challenge_it->second;
-        GT true_projection = server_->eval_one_cell_group_refs(
-            projection_a_refs, projection_b_refs, weights_, aggregate_key_,
-            first.layer_id, 1, round_id, 0, 0);
+        for (int col = 0; col < cols; ++col) {
+            for (int left = 0; left < factor_width; ++left) {
+                const Real value = oracle_a(left, col);
+                for (int right = 0; right < factor_width; ++right) {
+                    aat[left][right] +=
+                        value * oracle_a(right, col);
+                }
+            }
+        }
+        const Real baseline_norm_sq = gram_product_sum(btb, aat);
+        if (!(baseline_norm_sq > 0)) {
+            throw std::runtime_error(
+                "plaintext fixed-point baseline has zero Frobenius norm");
+        }
+
+        std::vector<const std::vector<A_Ciphertext_Slot>*> a_refs;
+        std::vector<const std::vector<B_SecretKey_Slot>*> b_refs;
+        a_refs.reserve(num_clients_);
+        b_refs.reserve(num_clients_);
+        for (const auto* update : ordered) {
+            const NativeLayerUpload& layer = update->layers[layer_index];
+            a_refs.push_back(&layer.encrypted_a);
+            b_refs.push_back(&layer.encrypted_b);
+        }
 
         IntMat cached_c(
             rows, std::vector<long long>(available_rank, 0));
@@ -586,7 +628,7 @@ SelectiveTwoServerSession::aggregate_round(
         NativeLayerSkeleton skeleton;
         bool verified = false;
         int previous_rank = 0;
-        int projection_checks = 0;
+        int baseline_checks = 0;
         std::size_t decrypted_cells = 0;
         for (int current_rank = rank_;
              current_rank <= available_rank;
@@ -651,43 +693,92 @@ SelectiveTwoServerSession::aggregate_round(
             }
             decrypted_cells += work.size();
 
-            FrMat core(
-                current_rank, std::vector<Fr>(current_rank));
-            std::vector<Fr> left(current_rank, Fr(0));
-            std::vector<Fr> right(current_rank, Fr(0));
-            for (int t = 0; t < current_rank; ++t) {
-                for (int j = 0; j < current_rank; ++j) {
-                    core[t][j] = ll_to_fr(cached_m[t][j]);
-                }
-                for (int row = 0; row < rows; ++row) {
-                    left[t] +=
-                        challenge.beta[row] * ll_to_fr(cached_c[row][t]);
-                }
-                for (int col = 0; col < cols; ++col) {
-                    right[t] +=
-                        ll_to_fr(cached_s[t][col]) * challenge.alpha[col];
+            const RealMat solved = solve_nonsingular_real(
+                cached_m, cached_s, current_rank, cols);
+            RealMat ctc(
+                current_rank, std::vector<Real>(current_rank, 0));
+            RealMat xxt(
+                current_rank, std::vector<Real>(current_rank, 0));
+            RealMat btc(
+                factor_width, std::vector<Real>(current_rank, 0));
+            RealMat axt(
+                factor_width, std::vector<Real>(current_rank, 0));
+            for (int row = 0; row < rows; ++row) {
+                for (int left = 0; left < current_rank; ++left) {
+                    const Real c_value =
+                        static_cast<Real>(cached_c[row][left]);
+                    for (int right = 0; right < current_rank; ++right) {
+                        ctc[left][right] += c_value *
+                            static_cast<Real>(cached_c[row][right]);
+                    }
+                    for (int component = 0;
+                         component < factor_width;
+                         ++component) {
+                        btc[component][left] +=
+                            oracle_b(row, component) * c_value;
+                    }
                 }
             }
-            const std::vector<Fr> solved =
-                solve_nonsingular(std::move(core), std::move(right));
-            Fr reconstructed_projection = 0;
-            for (int t = 0; t < current_rank; ++t) {
-                reconstructed_projection += left[t] * solved[t];
+            for (int col = 0; col < cols; ++col) {
+                for (int left = 0; left < current_rank; ++left) {
+                    const Real x_value = solved[left][col];
+                    for (int right = 0; right < current_rank; ++right) {
+                        xxt[left][right] +=
+                            x_value * solved[right][col];
+                    }
+                    for (int component = 0;
+                         component < factor_width;
+                         ++component) {
+                        axt[component][left] +=
+                            oracle_a(component, col) * x_value;
+                    }
+                }
             }
-            ++projection_checks;
-            verified = server_->group_encodes(
-                true_projection, reconstructed_projection);
+
+            const Real reconstructed_norm_sq =
+                gram_product_sum(ctc, xxt);
+            Real cross_inner_product = 0;
+            for (int component = 0;
+                 component < factor_width;
+                 ++component) {
+                for (int t = 0; t < current_rank; ++t) {
+                    cross_inner_product +=
+                        btc[component][t] * axt[component][t];
+                }
+            }
+            Real error_norm_sq =
+                baseline_norm_sq + reconstructed_norm_sq -
+                2 * cross_inner_product;
+            const Real cancellation_scale = std::max(
+                static_cast<Real>(1),
+                std::max(
+                    baseline_norm_sq,
+                    std::max(
+                        reconstructed_norm_sq,
+                        std::fabs(2 * cross_inner_product))));
+            if (std::fabs(error_norm_sq) <=
+                1e-15L * cancellation_scale) {
+                error_norm_sq = 0;
+            }
+            error_norm_sq = std::max(static_cast<Real>(0), error_norm_sq);
+            const Real relative_error =
+                std::sqrt(error_norm_sq / baseline_norm_sq);
+            ++baseline_checks;
+            verified = relative_error <= kBaselineRelativeTolerance;
             std::fprintf(
                 stderr,
-                "\n[SecLoRA] layer %d rank %d projection %s",
+                "\n[SecLoRA] layer %d rank %d baseline error %.3Le %s",
                 first.layer_id, current_rank,
+                relative_error,
                 verified ? "PASS" : "FAIL");
             if (verified) {
                 skeleton.layer_id = first.layer_id;
                 skeleton.rows = rows;
                 skeleton.cols = cols;
                 skeleton.selected_rank = current_rank;
-                skeleton.projection_checks = projection_checks;
+                skeleton.baseline_checks = baseline_checks;
+                skeleton.baseline_relative_error =
+                    static_cast<double>(relative_error);
                 skeleton.decrypted_cells = decrypted_cells;
                 skeleton.c.assign(
                     rows, std::vector<long long>(current_rank));
@@ -711,11 +802,11 @@ SelectiveTwoServerSession::aggregate_round(
         }
         if (!verified) {
             throw std::runtime_error(
-                "no projection-verified skeleton was found from R through "
+                "no plaintext-baseline-verified skeleton was found from R through "
                 "the public candidate pool; enlarge or change the public "
                 "pivot candidates");
         }
-        projection_challenges_.erase(challenge_key);
+        plaintext_oracles_.erase(oracle_key);
         output.push_back(std::move(skeleton));
     }
     std::fprintf(stderr, "\n");
@@ -724,7 +815,7 @@ SelectiveTwoServerSession::aggregate_round(
 
 void SelectiveTwoServerSession::close() {
     closed_ = true;
-    projection_challenges_.clear();
+    plaintext_oracles_.clear();
     clients_.clear();
     server_.reset();
 }

@@ -66,9 +66,10 @@ class SecLoRANativeTest(unittest.TestCase):
         self.assertGreaterEqual(skeleton.selected_rank, rank)
         self.assertLessEqual(skeleton.selected_rank, clients * rank)
         self.assertEqual(
-            skeleton.projection_checks,
+            skeleton.baseline_checks,
             skeleton.selected_rank - rank + 1,
         )
+        self.assertLessEqual(skeleton.baseline_relative_error, 1e-8)
         encrypted_rows = int(0.25 * rows)
         encrypted_cols = int(0.25 * cols)
         self.assertEqual(

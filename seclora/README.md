@@ -39,15 +39,13 @@ is intentionally preserved.
   at a time, up to `K*R`. Previously decrypted entries are cached. Increasing
   the rank by one therefore adds only one C column and one S row, including
   `encrypted_B_rows + encrypted_A_cols` new bounded recoveries at `S_D`.
-- Each client uploads one additional compressed PC-DMCFE pair for the public
-  random projection `beta^T * B_i * A_i * alpha`. This is needed because SEL-2S
-  intentionally omits ciphertext labels for the clear factor slices.
-- For every candidate rank, the output holder computes
-  `beta^T * C * M^-1 * S * alpha` in the scalar field and compares its group
-  encoding directly with the true encrypted projection. Projection checking
-  does not run BSGS. With uniform field challenges, an incorrect reconstruction
-  passes one check with probability at most `2/p`. The first passing rank is
-  returned.
+- For the paper's SEL-2S evaluation, the harness retains the complete quantized
+  client factors in a separate plaintext oracle. These values are not placed in
+  either server payload and are not counted as protocol communication.
+- For every candidate rank, the oracle measures
+  `||sum_i(B_i*A_i) - C*M^-1*S||_F / ||sum_i(B_i*A_i)||_F` in the encoded
+  integer domain. The equivalent low-rank Gram computation avoids materializing
+  the full `rows*cols` aggregate. The first rank at or below `1e-8` is returned.
 - `S_D` decrypts only the protected cells required by C and S. M and the clear
   portions of C/S are computed by `S_P`. If no candidate rank passes, the round
   fails explicitly instead of returning a potentially incomplete aggregate.
@@ -79,8 +77,10 @@ session.aggregate_round(round_id, updates) -> list[NativeLayerSkeleton]
 exposes `layer_id`, `c`, `m`, and `s`, where C/M/S contain signed decoded
 fixed-point integers. It also exposes:
 
-- `selected_rank`: first rank in `R..K*R` whose projection check passed.
-- `projection_checks`: number of attempted ranks.
+- `selected_rank`: first rank in `R..K*R` whose baseline check passed.
+- `baseline_checks`: number of attempted ranks.
+- `baseline_relative_error`: encoded-domain relative Frobenius error at the
+  selected rank.
 - `decrypted_cells`: unique protected C/S cells recovered with BSGS.
 
 The Python layer divides the reconstructed sum by
