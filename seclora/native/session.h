@@ -2,6 +2,7 @@
 #define SECLORA_NATIVE_SESSION_H
 
 #include <cstddef>
+#include <map>
 #include <memory>
 #include <string>
 #include <utility>
@@ -36,6 +37,10 @@ struct NativeLayerUpload {
     // S_D package: unselected slots remain unused.
     std::vector<A_Ciphertext_Slot> encrypted_a;
     std::vector<B_SecretKey_Slot> encrypted_b;
+
+    // One compressed PC-DMCFE pair for beta^T * DeltaW * alpha.
+    std::vector<A_Ciphertext_Slot> projection_a;
+    std::vector<B_SecretKey_Slot> projection_b;
     std::size_t serialized_size_bytes = 0;
 };
 
@@ -53,6 +58,9 @@ struct NativeLayerSkeleton {
     std::vector<std::vector<long long>> c;
     std::vector<std::vector<long long>> m;
     std::vector<std::vector<long long>> s;
+    int selected_rank = 0;
+    int projection_checks = 0;
+    std::size_t decrypted_cells = 0;
 };
 
 class SelectiveTwoServerSession {
@@ -65,7 +73,7 @@ public:
 
     std::vector<NativeLayerSkeleton> aggregate_round(
         int round_id,
-        const std::vector<std::shared_ptr<NativeClientUpdate>>& updates) const;
+        const std::vector<std::shared_ptr<NativeClientUpdate>>& updates);
 
     void close();
 
@@ -86,6 +94,14 @@ private:
     std::unique_ptr<PC_MCFE_Server> server_;
     std::vector<mcl::bn::Fr> weights_;
     std::pair<std::vector<mcl::bn::Fr>, mcl::bn::Fr> aggregate_key_;
+
+    struct ProjectionChallenge {
+        int rows = 0;
+        int cols = 0;
+        std::vector<mcl::bn::Fr> alpha;
+        std::vector<mcl::bn::Fr> beta;
+    };
+    std::map<std::pair<int, int>, ProjectionChallenge> projection_challenges_;
 
     void require_open() const;
     std::vector<std::vector<long long>> quantize_a(

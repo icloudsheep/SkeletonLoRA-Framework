@@ -55,6 +55,13 @@ void PC_MCFE_Client::SetLoraMatrices(const std::vector<std::vector<long long>>& 
     }
 }
 
+void PC_MCFE_Client::SetLoraMatricesFr(
+    const std::vector<std::vector<Fr>>& A,
+    const std::vector<std::vector<Fr>>& B) {
+    local_A = A;
+    local_B = B;
+}
+
 // Selective encryption: plaintext share for S_P (encrypted region zeroed out).
 void PC_MCFE_Client::BuildPlaintextShare(int eb, int ea,
                                          std::vector<std::vector<Fr>>& Bp,

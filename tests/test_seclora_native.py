@@ -63,6 +63,18 @@ class SecLoRANativeTest(unittest.TestCase):
         skeleton = session.aggregate_round(1, updates)[0]
         reconstructed = skeleton.c @ np.linalg.solve(skeleton.m, skeleton.s)
         np.testing.assert_allclose(reconstructed, expected, atol=1e-8)
+        self.assertGreaterEqual(skeleton.selected_rank, rank)
+        self.assertLessEqual(skeleton.selected_rank, clients * rank)
+        self.assertEqual(
+            skeleton.projection_checks,
+            skeleton.selected_rank - rank + 1,
+        )
+        encrypted_rows = int(0.25 * rows)
+        encrypted_cols = int(0.25 * cols)
+        self.assertEqual(
+            skeleton.decrypted_cells,
+            skeleton.selected_rank * (encrypted_rows + encrypted_cols),
+        )
         self.assertGreater(updates[0].serialized_size_bytes, 0)
         session.close()
 

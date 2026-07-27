@@ -32,16 +32,30 @@ is intentionally preserved.
 - `S_D` receives only PC-MCFE objects for the protected prefix and the public
   pivot candidate pool.
 - The candidate pool contains at most `2*K*R` deterministic, spread-out rows
-  and columns from the clear region. This keeps the end-to-end upload one-pass.
-- `S_P` verifies that the candidate block captures the rank of the complete
-  clear block. The round fails explicitly if it does not.
+  and columns from the clear region. Gaussian pivoting over this public block
+  produces nested nonsingular row/column choices; it is not used to estimate
+  the rank of the complete plaintext block.
+- Skeleton search starts at the configured LoRA rank `R` and increases one rank
+  at a time, up to `K*R`. Previously decrypted entries are cached. Increasing
+  the rank by one therefore adds only one C column and one S row, including
+  `encrypted_B_rows + encrypted_A_cols` new bounded recoveries at `S_D`.
+- Each client uploads one additional compressed PC-DMCFE pair for the public
+  random projection `beta^T * B_i * A_i * alpha`. This is needed because SEL-2S
+  intentionally omits ciphertext labels for the clear factor slices.
+- For every candidate rank, the output holder computes
+  `beta^T * C * M^-1 * S * alpha` in the scalar field and compares its group
+  encoding directly with the true encrypted projection. Projection checking
+  does not run BSGS. With uniform field challenges, an incorrect reconstruction
+  passes one check with probability at most `2/p`. The first passing rank is
+  returned.
 - `S_D` decrypts only the protected cells required by C and S. M and the clear
-  portions of C/S are computed by `S_P`.
+  portions of C/S are computed by `S_P`. If no candidate rank passes, the round
+  fails explicitly instead of returning a potentially incomplete aggregate.
 
 The two servers are enforced as separate payloads and computation paths inside
 one process. Physical process separation and transport serialization remain
-future deployment work. As in the standalone SEL-2S implementation, exact CUR
-recovery assumes that the clear block captures the aggregate matrix rank.
+future deployment work. Public pivot candidates must still contain a
+nonsingular intersection large enough for the successful skeleton rank.
 
 ## Native Contract
 
@@ -63,7 +77,11 @@ session.aggregate_round(round_id, updates) -> list[NativeLayerSkeleton]
 
 `NativeClientUpdate` exposes `serialized_size_bytes`. Each returned layer
 exposes `layer_id`, `c`, `m`, and `s`, where C/M/S contain signed decoded
-fixed-point integers.
+fixed-point integers. It also exposes:
+
+- `selected_rank`: first rank in `R..K*R` whose projection check passed.
+- `projection_checks`: number of attempted ranks.
+- `decrypted_cells`: unique protected C/S cells recovered with BSGS.
 
 The Python layer divides the reconstructed sum by
 `num_clients * 2^(2*sfp)` and compresses it back to the configured LoRA rank

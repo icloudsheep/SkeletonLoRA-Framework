@@ -41,57 +41,6 @@ Fr ll_to_fr(long long value) {
     return result;
 }
 
-int gauss_rank(FrMat matrix) {
-    if (matrix.empty()) return 0;
-    const int rows = static_cast<int>(matrix.size());
-    const int cols = static_cast<int>(matrix.front().size());
-    int pivot_row = 0;
-    for (int col = 0; col < cols && pivot_row < rows; ++col) {
-        int selected = -1;
-        for (int row = pivot_row; row < rows; ++row) {
-            if (!matrix[row][col].isZero()) {
-                selected = row;
-                break;
-            }
-        }
-        if (selected < 0) continue;
-        std::swap(matrix[selected], matrix[pivot_row]);
-        Fr inverse;
-        Fr::inv(inverse, matrix[pivot_row][col]);
-        for (int row = pivot_row + 1; row < rows; ++row) {
-            if (matrix[row][col].isZero()) continue;
-            Fr factor = matrix[row][col] * inverse;
-            for (int next = col; next < cols; ++next) {
-                matrix[row][next] -= factor * matrix[pivot_row][next];
-            }
-        }
-        ++pivot_row;
-    }
-    return pivot_row;
-}
-
-template <class VectorAt>
-std::vector<int> independent_indices(
-    const std::vector<int>& candidates, int width, int cap,
-    const VectorAt& vector_at) {
-    std::vector<int> selected;
-    FrMat basis;
-    for (int index : candidates) {
-        std::vector<Fr> row(width);
-        for (int col = 0; col < width; ++col) {
-            row[col] = ll_to_fr(vector_at(index, col));
-        }
-        FrMat trial = basis;
-        trial.push_back(std::move(row));
-        if (gauss_rank(trial) == static_cast<int>(basis.size()) + 1) {
-            basis = std::move(trial);
-            selected.push_back(index);
-            if (static_cast<int>(selected.size()) == cap) break;
-        }
-    }
-    return selected;
-}
-
 template <class Cell>
 std::pair<std::vector<int>, std::vector<int>> select_square_pivots(
     const std::vector<int>& row_candidates,
@@ -147,6 +96,41 @@ std::pair<std::vector<int>, std::vector<int>> select_square_pivots(
     row_ids.resize(rank);
     col_ids.resize(rank);
     return std::make_pair(std::move(row_ids), std::move(col_ids));
+}
+
+std::vector<Fr> solve_nonsingular(FrMat matrix, std::vector<Fr> rhs) {
+    const int rank = static_cast<int>(matrix.size());
+    if (static_cast<int>(rhs.size()) != rank) {
+        throw std::invalid_argument("finite-field solve dimension mismatch");
+    }
+    for (int col = 0; col < rank; ++col) {
+        int pivot = col;
+        while (pivot < rank && matrix[pivot][col].isZero()) ++pivot;
+        if (pivot == rank) {
+            throw std::runtime_error("selected skeleton core is singular");
+        }
+        if (pivot != col) {
+            std::swap(matrix[pivot], matrix[col]);
+            std::swap(rhs[pivot], rhs[col]);
+        }
+
+        Fr inverse;
+        Fr::inv(inverse, matrix[col][col]);
+        for (int next = col; next < rank; ++next) {
+            matrix[col][next] *= inverse;
+        }
+        rhs[col] *= inverse;
+
+        for (int row = 0; row < rank; ++row) {
+            if (row == col || matrix[row][col].isZero()) continue;
+            const Fr factor = matrix[row][col];
+            for (int next = col; next < rank; ++next) {
+                matrix[row][next] -= factor * matrix[col][next];
+            }
+            rhs[row] -= factor * rhs[col];
+        }
+    }
+    return rhs;
 }
 
 uint64_t mix_index(uint64_t value) {
@@ -331,6 +315,26 @@ SelectiveTwoServerSession::encrypt_client(
         const int eb = static_cast<int>(ratio_ * layer.rows);
         const int ea = static_cast<int>(ratio_ * layer.cols);
         const int candidate_count = 2 * num_clients_ * rank_;
+        const auto challenge_key =
+            std::make_pair(round_id, layer.layer_id);
+        auto challenge_it = projection_challenges_.find(challenge_key);
+        if (challenge_it == projection_challenges_.end()) {
+            ProjectionChallenge challenge;
+            challenge.rows = layer.rows;
+            challenge.cols = layer.cols;
+            challenge.alpha.resize(layer.cols);
+            challenge.beta.resize(layer.rows);
+            for (auto& value : challenge.alpha) value.setByCSPRNG();
+            for (auto& value : challenge.beta) value.setByCSPRNG();
+            challenge_it = projection_challenges_
+                .emplace(challenge_key, std::move(challenge)).first;
+        } else if (
+            challenge_it->second.rows != layer.rows ||
+            challenge_it->second.cols != layer.cols) {
+            throw std::invalid_argument(
+                "layer id reused with different projection dimensions");
+        }
+        const ProjectionChallenge& challenge = challenge_it->second;
 
         NativeLayerUpload payload;
         payload.layer_id = layer.layer_id;
@@ -396,6 +400,36 @@ SelectiveTwoServerSession::encrypt_client(
         }
         client.ClearEncryptionPrecompute();
 
+        std::vector<std::vector<Fr>> projected_a(
+            rank_, std::vector<Fr>(1, Fr(0)));
+        std::vector<std::vector<Fr>> projected_b(
+            1, std::vector<Fr>(rank_, Fr(0)));
+        for (int k = 0; k < rank_; ++k) {
+            for (int col = 0; col < layer.cols; ++col) {
+                projected_a[k][0] +=
+                    ll_to_fr(a[k][col]) * challenge.alpha[col];
+            }
+            for (int row = 0; row < layer.rows; ++row) {
+                projected_b[0][k] +=
+                    challenge.beta[row] * ll_to_fr(b[row][k]);
+            }
+        }
+        client.SetLoraMatricesFr(projected_a, projected_b);
+        try {
+            client.precompute_encA_indices_mt(
+                layer.layer_id, 1, round_id, 1, {0}, threads_);
+            client.precompute_encB_indices_mt(
+                layer.layer_id, 1, round_id, 1, {0}, threads_);
+            payload.projection_a = client.encA_indices_mt(
+                layer.layer_id, 1, round_id, 1, {0}, threads_);
+            payload.projection_b = client.encB_indices_mt(
+                layer.layer_id, 1, round_id, 1, {0}, threads_);
+        } catch (...) {
+            client.ClearEncryptionPrecompute();
+            throw;
+        }
+        client.ClearEncryptionPrecompute();
+
         payload.serialized_size_bytes =
             (static_cast<std::size_t>(layer.rows - eb) * rank_ +
              static_cast<std::size_t>(layer.cols - ea) * rank_) *
@@ -406,6 +440,8 @@ SelectiveTwoServerSession::encrypt_client(
         for (int row : encrypted_rows) {
             payload.serialized_size_bytes += b_slot_bytes(payload.encrypted_b[row]);
         }
+        payload.serialized_size_bytes += a_slot_bytes(payload.projection_a[0]);
+        payload.serialized_size_bytes += b_slot_bytes(payload.projection_b[0]);
         update->serialized_size_bytes += payload.serialized_size_bytes;
         update->layers.push_back(std::move(payload));
     }
@@ -416,7 +452,7 @@ SelectiveTwoServerSession::encrypt_client(
 std::vector<NativeLayerSkeleton>
 SelectiveTwoServerSession::aggregate_round(
     int round_id,
-    const std::vector<std::shared_ptr<NativeClientUpdate>>& updates) const {
+    const std::vector<std::shared_ptr<NativeClientUpdate>>& updates) {
     require_open();
     if (static_cast<int>(updates.size()) != num_clients_) {
         throw std::invalid_argument("aggregate_round requires every configured client");
@@ -480,78 +516,64 @@ SelectiveTwoServerSession::aggregate_round(
 
         const int aggregate_rank_cap =
             std::min(std::min(rows, cols), num_clients_ * rank_);
-        std::vector<int> clear_rows;
-        std::vector<int> clear_cols;
-        for (int row = eb; row < rows; ++row) clear_rows.push_back(row);
-        for (int col = ea; col < cols; ++col) clear_cols.push_back(col);
-        if (clear_rows.empty() || clear_cols.empty()) {
+        if (eb >= rows || ea >= cols) {
             throw std::runtime_error(
                 "SEL-2S needs a nonempty plaintext row and column region");
         }
 
-        const int factor_width = num_clients_ * rank_;
-        std::vector<int> row_basis = independent_indices(
-            clear_rows, factor_width, aggregate_rank_cap,
-            [&](int row, int component) {
-                const int client_id = component / rank_;
-                const int k = component % rank_;
-                return ordered[client_id]
-                    ->layers[layer_index].plain_b[row - eb][k];
-            });
-        std::vector<int> col_basis = independent_indices(
-            clear_cols, factor_width, aggregate_rank_cap,
-            [&](int col, int component) {
-                const int client_id = component / rank_;
-                const int k = component % rank_;
-                return ordered[client_id]
-                    ->layers[layer_index].plain_a[k][col - ea];
-            });
-        auto full_clear_pivots = select_square_pivots(
-            row_basis, col_basis, aggregate_rank_cap, sp_cell);
         auto candidate_pivots = select_square_pivots(
             first.candidate_rows, first.candidate_cols,
             aggregate_rank_cap, sp_cell);
-        if (candidate_pivots.first.size() != full_clear_pivots.first.size()) {
+        if (candidate_pivots.first.size() < static_cast<std::size_t>(rank_)) {
             throw std::runtime_error(
-                "public pivot candidate pool misses plaintext-block rank; "
-                "increase the candidate-pool multiplier");
+                "public pivot candidate pool cannot form the initial "
+                "rank-R nonsingular skeleton");
         }
 
         const std::vector<int>& pivot_rows = candidate_pivots.first;
         const std::vector<int>& pivot_cols = candidate_pivots.second;
-        const int recovered_rank = static_cast<int>(pivot_rows.size());
-
-        NativeLayerSkeleton skeleton;
-        skeleton.layer_id = first.layer_id;
-        skeleton.rows = rows;
-        skeleton.cols = cols;
-        skeleton.c.assign(rows, std::vector<long long>(recovered_rank, 0));
-        skeleton.m.assign(
-            recovered_rank, std::vector<long long>(recovered_rank, 0));
-        skeleton.s.assign(
-            recovered_rank, std::vector<long long>(cols, 0));
-
-        for (int t = 0; t < recovered_rank; ++t) {
-            for (int row = eb; row < rows; ++row) {
-                skeleton.c[row][t] = sp_cell(row, pivot_cols[t]);
-            }
-            for (int col = ea; col < cols; ++col) {
-                skeleton.s[t][col] = sp_cell(pivot_rows[t], col);
-            }
-            for (int j = 0; j < recovered_rank; ++j) {
-                skeleton.m[t][j] = sp_cell(pivot_rows[t], pivot_cols[j]);
-            }
-        }
+        const int available_rank = static_cast<int>(pivot_rows.size());
 
         std::vector<const std::vector<A_Ciphertext_Slot>*> a_refs;
         std::vector<const std::vector<B_SecretKey_Slot>*> b_refs;
+        std::vector<const std::vector<A_Ciphertext_Slot>*> projection_a_refs;
+        std::vector<const std::vector<B_SecretKey_Slot>*> projection_b_refs;
         a_refs.reserve(num_clients_);
         b_refs.reserve(num_clients_);
+        projection_a_refs.reserve(num_clients_);
+        projection_b_refs.reserve(num_clients_);
         for (const auto* update : ordered) {
             const NativeLayerUpload& layer = update->layers[layer_index];
+            if (layer.projection_a.size() != 1 ||
+                layer.projection_b.size() != 1) {
+                throw std::invalid_argument(
+                    "client update is missing its projection ciphertext");
+            }
             a_refs.push_back(&layer.encrypted_a);
             b_refs.push_back(&layer.encrypted_b);
+            projection_a_refs.push_back(&layer.projection_a);
+            projection_b_refs.push_back(&layer.projection_b);
         }
+
+        const auto challenge_key =
+            std::make_pair(round_id, first.layer_id);
+        const auto challenge_it =
+            projection_challenges_.find(challenge_key);
+        if (challenge_it == projection_challenges_.end()) {
+            throw std::runtime_error(
+                "projection challenge is unavailable for this layer");
+        }
+        const ProjectionChallenge& challenge = challenge_it->second;
+        GT true_projection = server_->eval_one_cell_group_refs(
+            projection_a_refs, projection_b_refs, weights_, aggregate_key_,
+            first.layer_id, 1, round_id, 0, 0);
+
+        IntMat cached_c(
+            rows, std::vector<long long>(available_rank, 0));
+        IntMat cached_m(
+            available_rank, std::vector<long long>(available_rank, 0));
+        IntMat cached_s(
+            available_rank, std::vector<long long>(cols, 0));
 
         struct DecryptCell {
             int row;
@@ -560,44 +582,140 @@ SelectiveTwoServerSession::aggregate_round(
             int skeleton_col;
             bool writes_c;
         };
-        std::vector<DecryptCell> work;
-        work.reserve(
-            static_cast<std::size_t>(eb + ea) * recovered_rank);
-        for (int t = 0; t < recovered_rank; ++t) {
-            for (int row = 0; row < eb; ++row) {
-                work.push_back({row, pivot_cols[t], row, t, true});
-            }
-            for (int col = 0; col < ea; ++col) {
-                work.push_back({pivot_rows[t], col, t, col, false});
-            }
-        }
 
-        std::vector<long long> decrypted(work.size(), 0);
-        std::vector<unsigned char> found(work.size(), 0);
-        parallel_for(static_cast<int>(work.size()), threads_, [&](int index) {
-            const DecryptCell& cell = work[index];
-            GT group = server_->eval_one_cell_group_refs(
-                a_refs, b_refs, weights_, aggregate_key_,
-                first.layer_id, 0, round_id, cell.row, cell.col);
-            bool cell_found = false;
-            decrypted[index] = server_->bsgs_search(group, cell_found);
-            found[index] = cell_found ? 1 : 0;
-        });
-        for (std::size_t index = 0; index < work.size(); ++index) {
-            if (!found[index]) {
-                throw std::runtime_error(
-                    "BSGS failed for a protected skeleton cell; "
-                    "check sfp, xmax, and the public bound");
+        NativeLayerSkeleton skeleton;
+        bool verified = false;
+        int previous_rank = 0;
+        int projection_checks = 0;
+        std::size_t decrypted_cells = 0;
+        for (int current_rank = rank_;
+             current_rank <= available_rank;
+             ++current_rank) {
+            const int added_begin =
+                previous_rank == 0 ? 0 : current_rank - 1;
+            for (int t = added_begin; t < current_rank; ++t) {
+                for (int row = eb; row < rows; ++row) {
+                    cached_c[row][t] = sp_cell(row, pivot_cols[t]);
+                }
+                for (int col = ea; col < cols; ++col) {
+                    cached_s[t][col] = sp_cell(pivot_rows[t], col);
+                }
+                for (int j = 0; j <= t; ++j) {
+                    cached_m[t][j] =
+                        sp_cell(pivot_rows[t], pivot_cols[j]);
+                    cached_m[j][t] =
+                        sp_cell(pivot_rows[j], pivot_cols[t]);
+                }
             }
-            const DecryptCell& cell = work[index];
-            if (cell.writes_c) {
-                skeleton.c[cell.skeleton_row][cell.skeleton_col] =
-                    decrypted[index];
-            } else {
-                skeleton.s[cell.skeleton_row][cell.skeleton_col] =
-                    decrypted[index];
+
+            std::vector<DecryptCell> work;
+            work.reserve(
+                static_cast<std::size_t>(eb + ea) *
+                (current_rank - added_begin));
+            for (int t = added_begin; t < current_rank; ++t) {
+                for (int row = 0; row < eb; ++row) {
+                    work.push_back({row, pivot_cols[t], row, t, true});
+                }
+                for (int col = 0; col < ea; ++col) {
+                    work.push_back({pivot_rows[t], col, t, col, false});
+                }
             }
+
+            std::vector<long long> decrypted(work.size(), 0);
+            std::vector<unsigned char> found(work.size(), 0);
+            parallel_for(
+                static_cast<int>(work.size()), threads_, [&](int index) {
+                    const DecryptCell& cell = work[index];
+                    GT group = server_->eval_one_cell_group_refs(
+                        a_refs, b_refs, weights_, aggregate_key_,
+                        first.layer_id, 0, round_id, cell.row, cell.col);
+                    bool cell_found = false;
+                    decrypted[index] =
+                        server_->bsgs_search(group, cell_found);
+                    found[index] = cell_found ? 1 : 0;
+                });
+            for (std::size_t index = 0; index < work.size(); ++index) {
+                if (!found[index]) {
+                    throw std::runtime_error(
+                        "BSGS failed for a protected skeleton cell; "
+                        "check sfp, xmax, and the public bound");
+                }
+                const DecryptCell& cell = work[index];
+                if (cell.writes_c) {
+                    cached_c[cell.skeleton_row][cell.skeleton_col] =
+                        decrypted[index];
+                } else {
+                    cached_s[cell.skeleton_row][cell.skeleton_col] =
+                        decrypted[index];
+                }
+            }
+            decrypted_cells += work.size();
+
+            FrMat core(
+                current_rank, std::vector<Fr>(current_rank));
+            std::vector<Fr> left(current_rank, Fr(0));
+            std::vector<Fr> right(current_rank, Fr(0));
+            for (int t = 0; t < current_rank; ++t) {
+                for (int j = 0; j < current_rank; ++j) {
+                    core[t][j] = ll_to_fr(cached_m[t][j]);
+                }
+                for (int row = 0; row < rows; ++row) {
+                    left[t] +=
+                        challenge.beta[row] * ll_to_fr(cached_c[row][t]);
+                }
+                for (int col = 0; col < cols; ++col) {
+                    right[t] +=
+                        ll_to_fr(cached_s[t][col]) * challenge.alpha[col];
+                }
+            }
+            const std::vector<Fr> solved =
+                solve_nonsingular(std::move(core), std::move(right));
+            Fr reconstructed_projection = 0;
+            for (int t = 0; t < current_rank; ++t) {
+                reconstructed_projection += left[t] * solved[t];
+            }
+            ++projection_checks;
+            verified = server_->group_encodes(
+                true_projection, reconstructed_projection);
+            std::fprintf(
+                stderr,
+                "\n[SecLoRA] layer %d rank %d projection %s",
+                first.layer_id, current_rank,
+                verified ? "PASS" : "FAIL");
+            if (verified) {
+                skeleton.layer_id = first.layer_id;
+                skeleton.rows = rows;
+                skeleton.cols = cols;
+                skeleton.selected_rank = current_rank;
+                skeleton.projection_checks = projection_checks;
+                skeleton.decrypted_cells = decrypted_cells;
+                skeleton.c.assign(
+                    rows, std::vector<long long>(current_rank));
+                for (int row = 0; row < rows; ++row) {
+                    std::copy_n(
+                        cached_c[row].begin(), current_rank,
+                        skeleton.c[row].begin());
+                }
+                skeleton.m.assign(
+                    current_rank, std::vector<long long>(current_rank));
+                for (int t = 0; t < current_rank; ++t) {
+                    std::copy_n(
+                        cached_m[t].begin(), current_rank,
+                        skeleton.m[t].begin());
+                }
+                skeleton.s.assign(
+                    cached_s.begin(), cached_s.begin() + current_rank);
+                break;
+            }
+            previous_rank = current_rank;
         }
+        if (!verified) {
+            throw std::runtime_error(
+                "no projection-verified skeleton was found from R through "
+                "the public candidate pool; enlarge or change the public "
+                "pivot candidates");
+        }
+        projection_challenges_.erase(challenge_key);
         output.push_back(std::move(skeleton));
     }
     std::fprintf(stderr, "\n");
@@ -606,6 +724,7 @@ SelectiveTwoServerSession::aggregate_round(
 
 void SelectiveTwoServerSession::close() {
     closed_ = true;
+    projection_challenges_.clear();
     clients_.clear();
     server_.reset();
 }

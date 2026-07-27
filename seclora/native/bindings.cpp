@@ -96,7 +96,13 @@ PYBIND11_MODULE(_seclora_native, module) {
         .def_property_readonly(
             "s", [](const NativeLayerSkeleton& value) {
                 return matrix_array(value.s, value.cols);
-            });
+            })
+        .def_readonly(
+            "selected_rank", &NativeLayerSkeleton::selected_rank)
+        .def_readonly(
+            "projection_checks", &NativeLayerSkeleton::projection_checks)
+        .def_readonly(
+            "decrypted_cells", &NativeLayerSkeleton::decrypted_cells);
 
     py::class_<SelectiveTwoServerSession>(
         module, "SelectiveTwoServerSession")

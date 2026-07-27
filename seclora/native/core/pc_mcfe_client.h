@@ -55,6 +55,9 @@ public:
     // Inject real quantized integer factors. A: rank x cols, B: rows x rank.
     void SetLoraMatrices(const std::vector<std::vector<long long>>& A,
                          const std::vector<std::vector<long long>>& B);
+    void SetLoraMatricesFr(
+        const std::vector<std::vector<mcl::bn::Fr>>& A,
+        const std::vector<std::vector<mcl::bn::Fr>>& B);
 
     // Selective encryption: build this client's PLAINTEXT share for server S_P.
     // Only the plaintext region is included -- encrypted B rows [0,eb) and encrypted
