@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG="${1:-$ROOT/configs/default.yaml}"
+RUN_ID="${2:-}"
+TARGET="${3:-train}"
+EVALUATION_CONFIG="${4:-$ROOT/configs/evaluation.yaml}"
+EXPECTED_ENV="skeleton_lora_fe"
+
+if [[ -z "$RUN_ID" ]]; then
+    echo "[evaluate.sh] 错误：run-id 不能为空"
+    echo "[evaluate.sh] 用法：bash evaluate.sh [config] <run-id> [train|mmlu|gsm8k] [evaluation-config]"
+    echo "[evaluate.sh] 示例：bash evaluate.sh configs/ckks.yaml 2026-07-27_19-31-58 mmlu"
+    exit 1
+fi
+
+if [[ -z "${CONDA_PREFIX:-}" ]]; then
+    echo "[evaluate.sh] 错误：当前没有激活 Conda 环境"
+    echo "[evaluate.sh] 请先执行：conda activate $EXPECTED_ENV"
+    exit 1
+fi
+
+if [[ "${CONDA_DEFAULT_ENV:-}" != "$EXPECTED_ENV" ]]; then
+    echo "[evaluate.sh] 错误：当前环境是 ${CONDA_DEFAULT_ENV:-unknown}"
+    echo "[evaluate.sh] 请先执行：conda activate $EXPECTED_ENV"
+    exit 1
+fi
+
+PYTHON="$CONDA_PREFIX/bin/python"
+LIBSTDCPP="$CONDA_PREFIX/lib/libstdc++.so.6"
+
+if [[ ! -x "$PYTHON" ]]; then
+    echo "[evaluate.sh] 错误：找不到 Python：$PYTHON"
+    exit 1
+fi
+
+if [[ ! -e "$LIBSTDCPP" ]]; then
+    echo "[evaluate.sh] 错误：找不到 $LIBSTDCPP"
+    exit 1
+fi
+
+cd "$ROOT"
+
+export HF_HOME="$ROOT/hf-cache"
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_PRELOAD="$LIBSTDCPP${LD_PRELOAD:+:$LD_PRELOAD}"
+
+mkdir -p "$HF_HOME"
+
+echo "[evaluate.sh] conda env=$CONDA_DEFAULT_ENV"
+echo "[evaluate.sh] python=$PYTHON"
+echo "[evaluate.sh] config=$CONFIG"
+echo "[evaluate.sh] run_id=$RUN_ID"
+echo "[evaluate.sh] target=$TARGET"
+echo "[evaluate.sh] evaluation_config=$EVALUATION_CONFIG"
+
+"$PYTHON" "$ROOT/evaluate.py" \
+    --config "$CONFIG" \
+    --run-id "$RUN_ID" \
+    --target "$TARGET" \
+    --evaluation-config "$EVALUATION_CONFIG"

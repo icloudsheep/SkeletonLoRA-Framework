@@ -5,13 +5,16 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import time
 from pathlib import Path
 
 import torch
 from peft import set_peft_model_state_dict
 from safetensors.torch import load_file
+from tqdm.auto import tqdm
 
 from datasets import build_dataloader, build_shards
+from evaluation import run_benchmark
 from models import build_model
 from runtime import build_peft_model, pick_device
 from runtime.loss import compute_loss, move_batch
@@ -22,6 +25,17 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True, help="yaml 配置文件路径")
     parser.add_argument("--run-id", required=True, help="output 下的 RUN_ID")
+    parser.add_argument(
+        "--target",
+        choices=("train", "mmlu", "gsm8k"),
+        default="train",
+        help="评测目标，train 为原客户端训练分片",
+    )
+    parser.add_argument(
+        "--evaluation-config",
+        default=str(Path(__file__).parent / "configs" / "evaluation.yaml"),
+        help="专业基准配置文件路径",
+    )
     args = parser.parse_args()
 
     root = Path(__file__).parent
@@ -37,33 +51,103 @@ def main() -> None:
     set_peft_model_state_dict(model, state, adapter_name="client_0")
     model.eval()
 
+    if args.target != "train":
+        evaluation_config = load_yaml(args.evaluation_config).get("evaluation", {})
+        if args.target not in evaluation_config:
+            raise KeyError(f"评测配置缺少 evaluation.{args.target}")
+        result = run_benchmark(
+            args.target,
+            model=model,
+            model_config=config["model"],
+            benchmark_config=evaluation_config[args.target],
+            device=device,
+            run_id=args.run_id,
+        )
+        output_path = run_dir / "metrics" / f"{args.target}.csv"
+        _write_rows(output_path, result.fieldnames, result.rows)
+        print(f"[evaluate] {result.summary}")
+        print(f"[evaluate] 全部完成: 结果已保存到 {output_path}")
+        return
+
+    _evaluate_training_shards(model, config, device, run_dir, args.run_id)
+
+
+def _evaluate_training_shards(
+    model: torch.nn.Module,
+    config: dict,
+    device: torch.device,
+    run_dir: Path,
+    run_id: str,
+) -> None:
     shards = build_shards(config)
     rows = []
+    print(f"[evaluate] 开始评估: target=train run_id={run_id} clients={len(shards)} device={device}")
     for client_id, shard in enumerate(shards):
-        loss = _eval_loss(model, build_dataloader(config, shard), config["model"]["kind"], device)
+        dataloader = build_dataloader(config, shard)
+        print(
+            f"[evaluate] client {client_id}: 开始评估 "
+            f"samples={len(shard)} batches={len(dataloader)}"
+        )
+        started = time.perf_counter()
+        loss = _eval_loss(
+            model,
+            dataloader,
+            config["model"]["kind"],
+            device,
+            client_id=client_id,
+        )
+        elapsed = time.perf_counter() - started
+        perplexity = _perplexity(loss, config["model"]["kind"])
         rows.append({
-            "run_id": args.run_id,
+            "run_id": run_id,
             "client_id": client_id,
             "loss": loss,
-            "perplexity": _perplexity(loss, config["model"]["kind"]),
+            "perplexity": perplexity,
         })
+        print(
+            f"[evaluate] client {client_id}: 评估完成 "
+            f"loss={loss:.6f} perplexity={perplexity:.6f} elapsed={elapsed:.1f}s"
+        )
 
-    metrics_dir = run_dir / "metrics"
-    metrics_dir.mkdir(parents=True, exist_ok=True)
-    with open(metrics_dir / "eval.csv", "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["run_id", "client_id", "loss", "perplexity"])
+    output_path = run_dir / "metrics" / "eval.csv"
+    _write_rows(output_path, ["run_id", "client_id", "loss", "perplexity"], rows)
+    print(f"[evaluate] 全部完成: 结果已保存到 {output_path}")
+
+
+def _write_rows(path: Path, fieldnames: list[str], rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
 
 
-def _eval_loss(model: torch.nn.Module, dataloader, model_kind: str, device: torch.device) -> float:
+def _eval_loss(
+    model: torch.nn.Module,
+    dataloader,
+    model_kind: str,
+    device: torch.device,
+    *,
+    client_id: int,
+) -> float:
     total_loss = 0.0
     total_batches = 0
     with torch.no_grad():
-        for batch in dataloader:
+        progress = tqdm(
+            dataloader,
+            desc=f"[evaluate] client {client_id}",
+            unit="batch",
+            dynamic_ncols=True,
+        )
+        for batch in progress:
             loss = compute_loss(model, move_batch(batch, device), model_kind)
-            total_loss += float(loss.detach().item())
+            current_loss = float(loss.detach().item())
+            total_loss += current_loss
             total_batches += 1
+            progress.set_postfix(
+                loss=f"{current_loss:.6f}",
+                avg_loss=f"{total_loss / total_batches:.6f}",
+            )
     if total_batches == 0:
         raise ValueError("评估数据为空")
     return total_loss / total_batches
