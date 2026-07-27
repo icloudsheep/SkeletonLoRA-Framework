@@ -1,11 +1,4 @@
-"""联邦 LoRA 微调入口: 极简编排。
-
-用户仅在下方钩子中填写业务逻辑,其他不动:
-  - encrypt_fn(state_dict, client_id, round_id) -> ciphertext (Any)
-  - decrypt_fn(ciphertext, client_id, round_id) -> state_dict
-  - aggregate_fn(list[state_dict], rank) -> state_dict
-  - secure_aggregate_fn(list[(client_id, ciphertext)], round_id) -> state_dict
-"""
+"""使用 SkeletonLoRA CKKS 密文聚合的联邦 LoRA 微调入口。"""
 
 from __future__ import annotations
 
@@ -26,23 +19,27 @@ from runtime import (
     seed_all,
 )
 from server import Server
+from skeleton_crypto import SkeletonLoRACrypto
 from training_progress import train_client_one_round
-from utils import CsvWriters, TbWriters, aggregate_lora_products, build_logger, load_yaml, perf_timer, sizeof
+from utils import CsvWriters, TbWriters, build_logger, load_yaml, perf_timer, sizeof
 
-# ==================== 用户可填的加解密聚合逻辑 ====================
-# 默认为「恒等 + 乘积 FedAvg 等权」,保证明文链路可跑通;换真加密只改下方钩子。
 
-# lambda 是「一屏可读的业务钩子占位」,替换真加密时可换成 def;
-# 静态检查器的 E731(lambda 赋名)在此为设计选择,不修。
-encrypt_fn = lambda state_dict, client_id, round_id: state_dict  # noqa: E731
+def _default_encryption_config(num_clients: int, rank: int) -> dict:
+    return {
+        "scheme": "ckks",
+        "mode": "full",
+        "ratio": None,
+        "skeleton": True,
+        "skeleton_rank": num_clients * rank,
+        "poly_modulus_degree": 8192,
+        "coeff_mod_bit_sizes": [60, 40, 40, 60],
+        "global_scale": 2 ** 40,
+        "cur_condition_threshold": 1e12,
+    }
 
-decrypt_fn = lambda ciphertext, client_id, round_id: ciphertext  # noqa: E731
 
-aggregate_fn = lambda plaintexts, rank: aggregate_lora_products(plaintexts, rank=rank)  # noqa: E731
-
-secure_aggregate_fn = None
-
-# =================================================================
+def _plaintext_path_disabled(*_args, **_kwargs):
+    raise RuntimeError("CKKS 模式不允许回退到明文聚合路径")
 
 
 def main() -> None:
@@ -62,15 +59,28 @@ def main() -> None:
     num_rounds = config["federated"]["num_rounds"]
     rank = config["lora"]["rank"]
 
+    crypto = SkeletonLoRACrypto(
+        config.get("encryption", _default_encryption_config(num_clients, rank)),
+        num_clients=num_clients,
+        rank=rank,
+    )
+    logger.info(
+        "CKKS 已就绪: mode=%s skeleton=%s skeleton_rank=%d degree=%d",
+        crypto.config.mode,
+        crypto.config.skeleton,
+        crypto.config.skeleton_rank,
+        crypto.config.poly_modulus_degree,
+    )
+
     model = build_peft_model(build_model(config["model"]), num_clients, config["lora"]).to(device)
     logger.info("模型就绪: kind=%s num_adapters=%d", config["model"]["kind"], num_clients)
 
     shards = build_shards(config)
-    clients = [Client(client_id=i, encrypt_fn=encrypt_fn) for i in range(num_clients)]
+    clients = [Client(client_id=i, encrypt_fn=crypto.encrypt) for i in range(num_clients)]
     server = Server(
-        decrypt_fn=decrypt_fn,
-        aggregate_fn=lambda plaintexts: aggregate_fn(plaintexts, rank),
-        secure_aggregate_fn=secure_aggregate_fn,
+        decrypt_fn=_plaintext_path_disabled,
+        aggregate_fn=_plaintext_path_disabled,
+        secure_aggregate_fn=crypto.secure_aggregate,
     )
 
     csv_w = CsvWriters(metrics_dir=paths.metrics_dir)

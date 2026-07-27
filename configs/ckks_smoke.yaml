@@ -1,0 +1,46 @@
+seed: 42
+
+federated:
+  num_clients: 2
+  num_rounds: 1
+  local_steps: 1
+
+lora:
+  rank: 2
+  alpha: 4
+  target_modules: ["linear"]
+
+train:
+  batch_size: 2
+  learning_rate: 2.0e-4
+  optimizer: adamw
+  weight_decay: 0.0
+  dtype: float32
+
+model:
+  kind: dummy
+  hidden_size: 16
+
+dataset:
+  kind: dummy
+  split_method: iid_uniform
+  num_samples: 8
+  input_dim: 16
+  output_dim: 16
+
+encryption:
+  scheme: ckks
+  mode: full
+  ratio: null
+  skeleton: true
+  skeleton_rank: 4
+  poly_modulus_degree: 8192
+  coeff_mod_bit_sizes: [60, 40, 40, 60]
+  global_scale: 1099511627776
+  cur_condition_threshold: 1.0e12
+
+logging:
+  level: INFO
+
+tensorboard:
+  port: 6006

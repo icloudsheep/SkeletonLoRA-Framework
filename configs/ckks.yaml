@@ -1,0 +1,49 @@
+# Default training config extended with SkeletonLoRA CKKS aggregation.
+
+seed: 42
+
+federated:
+  num_clients: 4
+  num_rounds: 10
+  local_steps: 50
+
+lora:
+  rank: 4
+  alpha: 8
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+train:
+  batch_size: 4
+  learning_rate: 2.0e-4
+  optimizer: adamw
+  weight_decay: 0.0
+  dtype: float32
+
+model:
+  kind: open_llama
+  name: open_llama_3b_v2
+  path: ./models/open_llama_3b_v2
+  dtype: float32
+
+dataset:
+  kind: dolly_15k
+  split_method: iid_uniform
+  path: ./datasets/databricks-dolly-15k/databricks-dolly-15k.jsonl
+  max_length: 512
+
+encryption:
+  scheme: ckks
+  mode: full
+  ratio: null
+  skeleton: true
+  skeleton_rank: 16
+  poly_modulus_degree: 8192
+  coeff_mod_bit_sizes: [60, 40, 40, 60]
+  global_scale: 1099511627776
+  cur_condition_threshold: 1.0e12
+
+logging:
+  level: INFO
+
+tensorboard:
+  port: 6006
