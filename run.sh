@@ -9,7 +9,7 @@
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG="${1:-$ROOT/configs/default.yaml}"
+CONFIG="${1:-$ROOT/configs/ckks.yaml}"
 PORT="${TB_PORT:-6006}"
 EXPECTED_ENV="skeleton_lora_fe"
 
