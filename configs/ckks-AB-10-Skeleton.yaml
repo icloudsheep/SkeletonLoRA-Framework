@@ -34,7 +34,7 @@ dataset:
 encryption:
   scheme: ckks
   mode: partial_AB
-  ratio: 1
+  ratio: 10
   skeleton: true
   skeleton_rank: 16
   poly_modulus_degree: 8192
