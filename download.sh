@@ -15,6 +15,7 @@ all resources are downloaded. Available targets:
   llama3bv2  openlm-research/open_llama_3b_v2
   llama7bv2  openlm-research/open_llama_7b_v2
   dolly       databricks/databricks-dolly-15k
+  natural-instructions  Muennighoff/natural-instructions train split
   mmlu-train  cais/mmlu auxiliary_train split
   gsm8k-train openai/gsm8k main train split
   mmlu        cais/mmlu test split
@@ -25,6 +26,7 @@ Examples:
   bash download.sh
   bash download.sh llama3bv2 dolly
   bash download.sh mmlu-train gsm8k-train
+  bash download.sh natural-instructions
   bash download.sh mmlu gsm8k
 EOF
 }
@@ -47,7 +49,7 @@ targets=("$@")
 needs_pyarrow=false
 for target in "${targets[@]}"; do
     case "$target" in
-        llama3bv2|llama7bv2|dolly) ;;
+        llama3bv2|llama7bv2|dolly|natural-instructions) ;;
         mmlu-train|gsm8k-train|mmlu|gsm8k|all) needs_pyarrow=true ;;
         *) usage >&2; die "unknown target: $target" ;;
     esac
@@ -97,6 +99,14 @@ download_dolly() {
         --dataset \
         --include databricks-dolly-15k.jsonl \
         --local-dir "$ROOT/datasets/databricks-dolly-15k"
+}
+
+download_natural_instructions() {
+    download_repo "Super-NaturalInstructions training set" \
+        Muennighoff/natural-instructions \
+        --dataset \
+        --include 'train/*.jsonl' \
+        --local-dir "$ROOT/datasets/natural-instructions"
 }
 
 download_mmlu_train() {
@@ -151,6 +161,7 @@ download_all() {
     download_llama3bv2
     download_llama7bv2
     download_dolly
+    download_natural_instructions
     download_mmlu_train
     download_gsm8k_train
     download_mmlu
@@ -162,6 +173,7 @@ for target in "${targets[@]}"; do
         llama3bv2) download_llama3bv2 ;;
         llama7bv2) download_llama7bv2 ;;
         dolly) download_dolly ;;
+        natural-instructions) download_natural_instructions ;;
         mmlu-train) download_mmlu_train ;;
         gsm8k-train) download_gsm8k_train ;;
         mmlu) download_mmlu ;;
