@@ -113,22 +113,42 @@ def _encrypt_or_plain(values, encrypted, public_ctx):
     return ("plain", values)
 
 
-def _block_terms(B, A, block, rank, public_ctx):
+def _block_term(B, A, block, component, public_ctx):
     rows = block.row_indices
     cols = block.col_indices
-    terms = []
+    vector = np.tile(B[rows, component], cols.size)
+    scalar = np.repeat(np.asarray(A[component, cols], dtype=np.float64), rows.size)
+    return (
+        _encrypt_or_plain(vector, block.b_encrypted, public_ctx),
+        _encrypt_or_plain(scalar, block.a_encrypted, public_ctx),
+    )
+
+
+def _block_terms(B, A, block, rank, public_ctx):
+    return [
+        _block_term(B, A, block, component, public_ctx)
+        for component in range(rank)
+    ]
+
+
+def iter_block_uploads(B, A, public_ctx, rank, block):
+    """逐项生成一个客户端的单块上传，限制 rank 展开数据的驻留数量。"""
+    B = np.asarray(B)
+    A = np.asarray(A)
+    if B.ndim != 2 or A.ndim != 2 or B.shape[1] != rank or A.shape[0] != rank:
+        raise ValueError(f"A/B 形状不符合 rank={rank}：A={A.shape}，B={B.shape}")
+    if not block.encrypted:
+        product = B[block.row_indices, :] @ A[:, block.col_indices]
+        yield {
+            "kind": "plain_product",
+            "payload": np.asarray(product.T.reshape(-1), dtype=np.float64),
+        }
+        return
     for component in range(rank):
-        vector = np.tile(B[rows, component], cols.size)
-        scalar = np.concatenate(
-            [np.full(rows.size, A[component, col], dtype=np.float64) for col in cols]
-        )
-        terms.append(
-            (
-                _encrypt_or_plain(vector, block.b_encrypted, public_ctx),
-                _encrypt_or_plain(scalar, block.a_encrypted, public_ctx),
-            )
-        )
-    return terms
+        yield {
+            "kind": "term",
+            "operands": _block_term(B, A, block, component, public_ctx),
+        }
 
 
 def encrypt_upload(B, A, public_ctx, rank, partition, blocks):
@@ -173,6 +193,66 @@ def _serialize_result(value):
     if isinstance(value, ts.CKKSVector):
         return {"kind": "ct", "payload": value.serialize()}
     return {"kind": "plain", "payload": np.asarray(value, dtype=np.float64)}
+
+
+def accumulate_block(accumulated, upload, public_ctx):
+    """把一个客户端的块上传累加到未解密的服务端块状态。"""
+    if upload["kind"] == "plain_product":
+        current = np.asarray(upload["payload"], dtype=np.float64)
+    elif upload["kind"] == "term":
+        left_raw, right_raw = upload["operands"]
+        current = _multiply(
+            _load_operand(left_raw, public_ctx),
+            _load_operand(right_raw, public_ctx),
+        )
+    elif upload["kind"] == "terms":
+        current = None
+        for left_raw, right_raw in upload["terms"]:
+            term = _multiply(
+                _load_operand(left_raw, public_ctx),
+                _load_operand(right_raw, public_ctx),
+            )
+            current = term if current is None else current + term
+    else:
+        raise ValueError(f"未知块上传类型: {upload['kind']}")
+    if current is None:
+        raise ValueError("块上传不包含可聚合数据")
+    if accumulated is None:
+        return current
+    if isinstance(accumulated, ts.CKKSVector):
+        accumulated += current
+    else:
+        np.add(accumulated, current, out=accumulated)
+    return accumulated
+
+
+def finalize_block(accumulated, block, n_clients):
+    """完成一个块的客户端均值计算并序列化结果。"""
+    if accumulated is None:
+        raise ValueError("块聚合状态不能为空")
+    if n_clients <= 0:
+        raise ValueError("n_clients 必须为正整数")
+    scale = 1.0 / n_clients
+    if isinstance(accumulated, ts.CKKSVector):
+        accumulated *= scale
+    else:
+        np.multiply(accumulated, scale, out=accumulated)
+    return {
+        "row_indices": block.row_indices.tolist(),
+        "col_indices": block.col_indices.tolist(),
+        **_serialize_result(accumulated),
+    }
+
+
+def decrypt_block(block_result, secret_ctx):
+    """解密一个聚合块，返回按列连续排列的浮点数组。"""
+    if block_result["kind"] == "ct":
+        values = ts.ckks_vector_from(secret_ctx, block_result["payload"]).decrypt()
+    elif block_result["kind"] == "plain":
+        values = block_result["payload"]
+    else:
+        raise ValueError(f"未知聚合块类型: {block_result['kind']}")
+    return np.asarray(values, dtype=np.float64)
 
 
 def aggregate(uploads, public_ctx, n_clients):

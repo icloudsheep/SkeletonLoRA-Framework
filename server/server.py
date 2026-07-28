@@ -13,10 +13,12 @@ class Server:
         secure_aggregate_fn: Optional[
             Callable[[List[Tuple[int, Any]], int], Dict[str, torch.Tensor]]
         ] = None,
+        secure_stream_aggregate_fn: Optional[Callable[..., Any]] = None,
     ) -> None:
         self._decrypt = decrypt_fn
         self._aggregate = aggregate_fn
         self._secure_aggregate = secure_aggregate_fn
+        self._secure_stream_aggregate = secure_stream_aggregate_fn
 
     def decrypt_aggregate(
         self,
@@ -30,3 +32,18 @@ class Server:
             for client_id, ciphertext in ciphertexts
         ]
         return self._aggregate(plaintexts)
+
+    def stream_decrypt_aggregate(
+        self,
+        plaintexts: List[Tuple[int, Dict[str, torch.Tensor]]],
+        round_id: int,
+        progress=None,
+    ):
+        """以流式安全聚合实现处理一轮客户端 LoRA 状态。"""
+        if self._secure_stream_aggregate is None:
+            raise RuntimeError("未配置流式安全聚合函数")
+        return self._secure_stream_aggregate(
+            plaintexts,
+            round_id,
+            progress=progress,
+        )
