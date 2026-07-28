@@ -3,9 +3,9 @@
 seed: 42
 
 federated:
-  num_clients: 8
+  num_clients: 2
   num_rounds: 20
-  local_steps: 100
+  local_steps: 300
 
 lora:
   rank: 4
