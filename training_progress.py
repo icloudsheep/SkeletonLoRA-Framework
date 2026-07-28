@@ -33,9 +33,20 @@ def train_client_one_round(
     model_kind = config["model"]["kind"]
 
     model.set_adapter(client.adapter_name)  # type: ignore[operator]
-    dataloader = build_dataloader(config, shard)
+    model.train()
+    trainable_params = adapter_trainable_params(model, client.adapter_name)
+    if not trainable_params:
+        raise RuntimeError(
+            f"adapter {client.adapter_name} 没有可训练参数，请检查 lora.target_modules"
+        )
+    dataloader = build_dataloader(
+        config,
+        shard,
+        round_id=rnd,
+        client_id=client.client_id,
+    )
     optimizer = torch.optim.AdamW(
-        adapter_trainable_params(model, client.adapter_name),
+        trainable_params,
         lr=config["train"]["learning_rate"],
         weight_decay=config["train"]["weight_decay"],
     )
@@ -61,8 +72,13 @@ def train_client_one_round(
             batch = next(data_iter)
         batch = move_batch(batch, device)
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         loss = compute_loss(model, batch, kind=model_kind)
+        if not torch.isfinite(loss).all().item():
+            raise FloatingPointError(
+                f"round {rnd} client {client.client_id} step {step + 1} "
+                f"出现非有限 loss: {loss.detach().item()}"
+            )
         loss.backward()
 
         global_step = (rnd - 1) * local_steps + step

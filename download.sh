@@ -15,6 +15,8 @@ all resources are downloaded. Available targets:
   llama3bv2  openlm-research/open_llama_3b_v2
   llama7bv2  openlm-research/open_llama_7b_v2
   dolly       databricks/databricks-dolly-15k
+  mmlu-train  cais/mmlu auxiliary_train split
+  gsm8k-train openai/gsm8k main train split
   mmlu        cais/mmlu test split
   gsm8k       openai/gsm8k main test split
   all         all targets above
@@ -22,6 +24,7 @@ all resources are downloaded. Available targets:
 Examples:
   bash download.sh
   bash download.sh llama3bv2 dolly
+  bash download.sh mmlu-train gsm8k-train
   bash download.sh mmlu gsm8k
 EOF
 }
@@ -45,13 +48,13 @@ needs_pyarrow=false
 for target in "${targets[@]}"; do
     case "$target" in
         llama3bv2|llama7bv2|dolly) ;;
-        mmlu|gsm8k|all) needs_pyarrow=true ;;
+        mmlu-train|gsm8k-train|mmlu|gsm8k|all) needs_pyarrow=true ;;
         *) usage >&2; die "unknown target: $target" ;;
     esac
 done
 
 if [[ $needs_pyarrow == true ]]; then
-    command -v python >/dev/null 2>&1 || die "python is required to convert evaluation datasets"
+    command -v python >/dev/null 2>&1 || die "python is required to convert Parquet datasets"
     python -c 'import pyarrow.parquet' >/dev/null 2>&1 \
         || die "pyarrow is required; install it in the current Python environment first"
 fi
@@ -175,6 +178,30 @@ download_dolly() {
         --local-dir "$ROOT/datasets/databricks-dolly-15k"
 }
 
+download_mmlu_train() {
+    local directory="$ROOT/datasets/mmlu"
+    download_repo "MMLU auxiliary training set" \
+        cais/mmlu \
+        --dataset \
+        --include all/auxiliary_train-00000-of-00001.parquet \
+        --local-dir "$directory"
+    convert_parquet mmlu \
+        "$directory/all/auxiliary_train-00000-of-00001.parquet" \
+        "$directory/mmlu_auxiliary_train.jsonl"
+}
+
+download_gsm8k_train() {
+    local directory="$ROOT/datasets/gsm8k"
+    download_repo "GSM8K main training set" \
+        openai/gsm8k \
+        --dataset \
+        --include main/train-00000-of-00001.parquet \
+        --local-dir "$directory"
+    convert_parquet gsm8k \
+        "$directory/main/train-00000-of-00001.parquet" \
+        "$directory/train.jsonl"
+}
+
 download_mmlu() {
     local directory="$ROOT/evaluation/mmlu"
     download_repo "MMLU test set" \
@@ -203,6 +230,8 @@ download_all() {
     download_llama3bv2
     download_llama7bv2
     download_dolly
+    download_mmlu_train
+    download_gsm8k_train
     download_mmlu
     download_gsm8k
 }
@@ -212,6 +241,8 @@ for target in "${targets[@]}"; do
         llama3bv2) download_llama3bv2 ;;
         llama7bv2) download_llama7bv2 ;;
         dolly) download_dolly ;;
+        mmlu-train) download_mmlu_train ;;
+        gsm8k-train) download_gsm8k_train ;;
         mmlu) download_mmlu ;;
         gsm8k) download_gsm8k ;;
         all) download_all ;;
