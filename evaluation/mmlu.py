@@ -35,7 +35,7 @@ def evaluate_mmlu(
     if max_length < 2:
         raise ValueError("evaluation.mmlu.max_length 必须至少为 2")
 
-    rows = []
+    question_rows = []
     subject_totals: dict[str, list[int]] = {}
     progress = tqdm(records, desc="[evaluate] MMLU", unit="question", dynamic_ncols=True)
     for index, record in enumerate(progress):
@@ -56,10 +56,11 @@ def evaluate_mmlu(
         totals = subject_totals.setdefault(record["subject"], [0, 0])
         totals[0] += int(correct)
         totals[1] += 1
-        rows.append(
+        question_rows.append(
             {
                 "run_id": run_id,
                 "benchmark": "mmlu",
+                "row_type": "question",
                 "subject": record["subject"],
                 "question_id": index,
                 "prediction": prediction,
@@ -68,10 +69,33 @@ def evaluate_mmlu(
             }
         )
         correct_count = sum(item[0] for item in subject_totals.values())
-        progress.set_postfix(accuracy=f"{correct_count / len(rows):.4f}")
+        progress.set_postfix(accuracy=f"{correct_count / len(question_rows):.4f}")
 
-    correct_count = sum(row["correct"] for row in rows)
-    overall = correct_count / len(rows)
+    correct_count = sum(row["correct"] for row in question_rows)
+    overall = correct_count / len(question_rows)
+    summary_rows = [
+        {
+            "run_id": run_id,
+            "benchmark": "mmlu",
+            "row_type": "overall",
+            "subject": "ALL",
+            "correct_count": correct_count,
+            "total_count": len(question_rows),
+            "accuracy": overall,
+        }
+    ]
+    summary_rows.extend(
+        {
+            "run_id": run_id,
+            "benchmark": "mmlu",
+            "row_type": "subject",
+            "subject": subject,
+            "correct_count": correct,
+            "total_count": total,
+            "accuracy": correct / total,
+        }
+        for subject, (correct, total) in sorted(subject_totals.items())
+    )
     subject_summary = ", ".join(
         f"{subject}={correct}/{total}"
         for subject, (correct, total) in sorted(subject_totals.items())
@@ -80,15 +104,19 @@ def evaluate_mmlu(
         fieldnames=[
             "run_id",
             "benchmark",
+            "row_type",
             "subject",
             "question_id",
             "prediction",
             "answer",
             "correct",
+            "correct_count",
+            "total_count",
+            "accuracy",
         ],
-        rows=rows,
+        rows=summary_rows + question_rows,
         summary=(
-            f"MMLU accuracy={overall:.6f} ({correct_count}/{len(rows)}); "
+            f"MMLU accuracy={overall:.6f} ({correct_count}/{len(question_rows)}); "
             f"subjects: {subject_summary}"
         ),
     )

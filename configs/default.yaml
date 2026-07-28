@@ -1,11 +1,11 @@
-# Default config: local OpenLLaMA 3B + local Databricks Dolly 15k.
+# Default config: local OpenLLaMA 3B + local MMLU auxiliary training set.
 
 seed: 42
 
 federated:
   num_clients: 4
   num_rounds: 10
-  local_steps: 50
+  local_steps: 300
 
 lora:
   rank: 4
@@ -26,9 +26,9 @@ model:
   dtype: float32
 
 dataset:
-  kind: dolly_15k
+  kind: mmlu_train
   split_method: iid_uniform
-  path: ./datasets/databricks-dolly-15k/databricks-dolly-15k.jsonl
+  path: ./datasets/mmlu/mmlu_auxiliary_train.jsonl
   max_length: 512
 
 logging:

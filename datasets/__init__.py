@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from datasets.dolly import build_dolly_shards
 from datasets.dummy import build_dummy_shards
+from datasets.mmlu_train import build_mmlu_train_shards
 
 
 def build_shards(config: dict) -> List[Dataset]:
@@ -22,6 +23,8 @@ def build_shards(config: dict) -> List[Dataset]:
         return build_dummy_shards(config)
     if kind == "dolly_15k":
         return build_dolly_shards(config)
+    if kind == "mmlu_train":
+        return build_mmlu_train_shards(config)
     raise ValueError(f"未知的 dataset kind: {kind}")
 
 
