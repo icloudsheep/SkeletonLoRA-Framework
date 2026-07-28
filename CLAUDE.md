@@ -2,6 +2,10 @@
 
 本文档面向后续代码协作者。描述以当前仓库代码为准，重点记录实验语义、模块边界和不可凭空假设的约束。
 
+## 必读文档
+
+执行或修改资源下载、训练启动、评估流程之前，必须先阅读 [instruction.md](./instruction.md)。该文档记录 `download.sh`、`run.sh` 和 `evaluate.sh` 的当前参数格式、默认值、资源路径、输出文件及完整调用案例。脚本实现和 YAML 配置仍是最终事实来源；文档与代码不一致时，应先核对实际实现并同步更正文档，不得自行补全不存在的命令、配置或运行行为。
+
 ## 项目目标
 
 框架用于单机模拟多客户端联邦 LoRA 微调：只加载一份基座模型，为每个客户端注册独立 adapter；客户端完成本地训练后上传 LoRA 状态，服务端执行解密与聚合，再把聚合结果广播给下一轮的所有客户端。
@@ -42,6 +46,7 @@ bash run.sh configs/<task>.yaml
 SkeletonLoRA-Framework/
 ├── main.py                       联邦训练编排与业务钩子
 ├── training_progress.py          当前生效的本地训练与训练指标实现
+├── instruction.md                下载、训练与评估脚本使用速查
 ├── run.sh                        环境检查、TensorBoard 和训练启动
 ├── evaluate.py                   checkpoint 评估入口
 ├── evaluate.sh                   评估环境检查与参数转发

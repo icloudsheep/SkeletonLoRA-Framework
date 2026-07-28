@@ -177,5 +177,6 @@ bash -n download.sh run.sh evaluate.sh
 
 ## 文档
 
+- [instruction.md](./instruction.md)：`download.sh`、`run.sh` 和 `evaluate.sh` 的参数、使用案例、输出路径与完整实验流程。执行下载、训练或评估前应先阅读此文档。
 - [CLAUDE.md](./CLAUDE.md)：代码边界、配置语义、训练状态、指标定义、评估方法和扩展约束。
 - [overview.md](./overview.md)：项目需求与早期设计背景。
