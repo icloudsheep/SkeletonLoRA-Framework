@@ -76,86 +76,7 @@ convert_parquet() {
     [[ -s "$source" ]] || die "downloaded Parquet file is missing or empty: $source"
     printf '[download.sh] converting %s to %s\n' "$source" "$destination"
 
-    # Validate records before replacing an existing JSONL, so a failed conversion remains recoverable.
-    python - "$benchmark" "$source" "$destination" <<'PY'
-import json
-import os
-from pathlib import Path
-import sys
-import tempfile
-
-import pyarrow.parquet as parquet
-
-benchmark, source_arg, destination_arg = sys.argv[1:]
-source = Path(source_arg)
-destination = Path(destination_arg)
-destination.parent.mkdir(parents=True, exist_ok=True)
-
-required_columns = {
-    "mmlu": {"question", "choices", "answer", "subject"},
-    "gsm8k": {"question", "answer"},
-}[benchmark]
-parquet_file = parquet.ParquetFile(source)
-missing = required_columns.difference(parquet_file.schema_arrow.names)
-if missing:
-    raise ValueError(f"{source} is missing columns: {', '.join(sorted(missing))}")
-
-temporary_path = None
-record_count = 0
-try:
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        dir=destination.parent,
-        prefix=f".{destination.name}.",
-        suffix=".tmp",
-        delete=False,
-    ) as output:
-        temporary_path = Path(output.name)
-        for batch in parquet_file.iter_batches(columns=sorted(required_columns)):
-            for record in batch.to_pylist():
-                question = record["question"]
-                answer = record["answer"]
-                if not isinstance(question, str) or not question.strip():
-                    raise ValueError(f"record {record_count + 1} has an invalid question")
-
-                if benchmark == "mmlu":
-                    choices = record["choices"]
-                    subject = record["subject"]
-                    if (
-                        not isinstance(choices, list)
-                        or len(choices) != 4
-                        or not all(isinstance(choice, str) for choice in choices)
-                    ):
-                        raise ValueError(f"MMLU record {record_count + 1} must have four choices")
-                    if isinstance(answer, bool) or not isinstance(answer, int) or not 0 <= answer < 4:
-                        raise ValueError(f"MMLU record {record_count + 1} has an invalid answer")
-                    if not isinstance(subject, str) or not subject.strip():
-                        raise ValueError(f"MMLU record {record_count + 1} has an invalid subject")
-                    converted = {
-                        "question": question,
-                        "choices": choices,
-                        "answer": answer,
-                        "subject": subject,
-                    }
-                else:
-                    if not isinstance(answer, str) or "####" not in answer:
-                        raise ValueError(f"GSM8K record {record_count + 1} has an invalid answer")
-                    converted = {"question": question, "answer": answer}
-
-                output.write(json.dumps(converted, ensure_ascii=False) + "\n")
-                record_count += 1
-
-    if record_count == 0:
-        raise ValueError(f"{source} contains no records")
-    os.replace(temporary_path, destination)
-except BaseException:
-    if temporary_path is not None:
-        temporary_path.unlink(missing_ok=True)
-    raise
-
-print(f"[download.sh] wrote {record_count} records to {destination}")
-PY
+    python "$ROOT/utils/convert_hf_parquet.py" "$benchmark" "$source" "$destination"
 }
 
 download_llama3bv2() {
@@ -185,7 +106,7 @@ download_mmlu_train() {
         --dataset \
         --include all/auxiliary_train-00000-of-00001.parquet \
         --local-dir "$directory"
-    convert_parquet mmlu \
+    convert_parquet mmlu_train \
         "$directory/all/auxiliary_train-00000-of-00001.parquet" \
         "$directory/mmlu_auxiliary_train.jsonl"
 }
