@@ -10,14 +10,16 @@
 
 ## 配置原则
 
-`configs/default.yaml` 与 `configs/loss.yaml` 都是基准配置，后续任务必须根据实验目的派生，不应把任一文件解释为所有任务的固定配置。
+`configs/default.yaml` 与 `configs/loss.yaml` 都是基准配置，后续任务必须根据实验目的派生，不应把任一文件解释为所有任务的固定配置。YAML 文件是参数的唯一真相源，下表仅记录当前基准快照。
 
-| 文件 | 基准含义 |
-|---|---|
-| `configs/default.yaml` | OpenLLaMA 3B、MMLU auxiliary train、常规多客户端训练 |
-| `configs/loss.yaml` | OpenLLaMA 3B、Super-NaturalInstructions、多客户端多 round 收敛实验 |
-| `configs/smoke.yaml` | dummy 模型与数据的快速端到端回归 |
-| `configs/evaluation.yaml` | MMLU/GSM8K 本地路径和评测长度 |
+| 文件 | 基准含义 | 当前关键参数 |
+|---|---|---|
+| `configs/default.yaml` | OpenLLaMA 3B、MMLU auxiliary train、常规联邦训练 | 4 clients、3 rounds、300 local steps、batch 4、LoRA rank 4、max length 512 |
+| `configs/loss.yaml` | OpenLLaMA 3B、Super-NaturalInstructions、收敛实验 | 2 clients、20 rounds、300 local steps、batch 4、LoRA rank 4、max length 512、最多 20000 samples |
+| `configs/smoke.yaml` | dummy 模型与数据的快速端到端回归 | 以 YAML 为准 |
+| `configs/evaluation.yaml` | MMLU/GSM8K 本地路径和评测长度 | 以 YAML 为准 |
+
+修改 `default.yaml` 或 `loss.yaml` 中定义基准实验语义的参数时，必须同步更新上表。普通派生任务只维护自己的配置，不反向修改基准快照。
 
 新增实验配置时，应从最接近的基准派生，并在文件中显式固定：
 
@@ -248,10 +250,12 @@ output/<run_id>/checkpoints/round_XX/
 ## 评估语义
 
 ```bash
-bash evaluate.sh configs/<task>.yaml <run_id> <train|mmlu|gsm8k>
+bash evaluate.sh configs/<task>.yaml <run_id> <train|mmlu|gsm8k> [adapter|base]
 ```
 
-评估必须使用与 checkpoint 匹配的模型和 LoRA 配置，否则 state dict 可能无法加载或结果无意义。
+默认 `adapter` 模式使用 `final/adapter_model.safetensors`，必须保证模型和 LoRA 配置与 checkpoint 匹配。`base` 模式直接评测配置中的底座模型，不创建 PEFT adapter，也不读取 checkpoint；此时 `run_id` 只负责把基线结果归入待对比实验的 `metrics/` 目录。
+
+adapter 结果沿用 `eval.csv`、`mmlu.csv`、`gsm8k.csv`，base 结果写入对应的 `*_base.csv`，避免彼此覆盖。所有评测 CSV 都包含 `model_mode` 字段。
 
 ### `train`
 

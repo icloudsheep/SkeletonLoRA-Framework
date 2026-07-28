@@ -36,20 +36,24 @@ def main() -> None:
         default=str(Path(__file__).parent / "configs" / "evaluation.yaml"),
         help="专业基准配置文件路径",
     )
+    parser.add_argument(
+        "--model-mode",
+        choices=("adapter", "base"),
+        default="adapter",
+        help="adapter 加载聚合 LoRA，base 只评测原始底座模型",
+    )
     args = parser.parse_args()
 
     root = Path(__file__).parent
     config = load_yaml(args.config)
     run_dir = root / "output" / args.run_id
-    adapter_path = run_dir / "checkpoints" / "final" / "adapter_model.safetensors"
-    if not adapter_path.exists():
-        raise FileNotFoundError(f"找不到 final adapter: {adapter_path}")
-
     device = pick_device()
-    model = build_peft_model(build_model(config["model"]), 1, config["lora"]).to(device)
-    state = load_file(str(adapter_path))
-    set_peft_model_state_dict(model, state, adapter_name="client_0")
+    model = _build_evaluation_model(config, run_dir, args.model_mode, device)
     model.eval()
+    print(
+        f"[evaluate] 模型就绪: mode={args.model_mode} "
+        f"model={config['model'].get('name', config['model']['kind'])} device={device}"
+    )
 
     if args.target != "train":
         evaluation_config = load_yaml(args.evaluation_config).get("evaluation", {})
@@ -63,13 +67,43 @@ def main() -> None:
             device=device,
             run_id=args.run_id,
         )
-        output_path = run_dir / "metrics" / f"{args.target}.csv"
-        _write_rows(output_path, result.fieldnames, result.rows)
+        fieldnames, rows = _add_model_mode(
+            result.fieldnames, result.rows, args.model_mode
+        )
+        output_path = run_dir / "metrics" / _output_filename(
+            args.target, args.model_mode
+        )
+        _write_rows(output_path, fieldnames, rows)
         print(f"[evaluate] {result.summary}")
         print(f"[evaluate] 全部完成: 结果已保存到 {output_path}")
         return
 
-    _evaluate_training_shards(model, config, device, run_dir, args.run_id)
+    _evaluate_training_shards(
+        model, config, device, run_dir, args.run_id, args.model_mode
+    )
+
+
+def _build_evaluation_model(
+    config: dict,
+    run_dir: Path,
+    model_mode: str,
+    device: torch.device,
+) -> torch.nn.Module:
+    """按评测模式构建底座模型，或加载聚合后的 LoRA adapter。"""
+    if model_mode == "base":
+        return build_model(config["model"]).to(device)
+    if model_mode != "adapter":
+        raise ValueError(f"未知的评测模型模式: {model_mode}")
+
+    adapter_path = run_dir / "checkpoints" / "final" / "adapter_model.safetensors"
+    if not adapter_path.exists():
+        raise FileNotFoundError(f"找不到 final adapter: {adapter_path}")
+    model = build_peft_model(
+        build_model(config["model"]), 1, config["lora"]
+    ).to(device)
+    state = load_file(str(adapter_path))
+    set_peft_model_state_dict(model, state, adapter_name="client_0")
+    return model
 
 
 def _evaluate_training_shards(
@@ -78,6 +112,7 @@ def _evaluate_training_shards(
     device: torch.device,
     run_dir: Path,
     run_id: str,
+    model_mode: str,
 ) -> None:
     shards = build_shards(config)
     rows = []
@@ -100,6 +135,7 @@ def _evaluate_training_shards(
         perplexity = _perplexity(loss, config["model"]["kind"])
         rows.append({
             "run_id": run_id,
+            "model_mode": model_mode,
             "client_id": client_id,
             "loss": loss,
             "perplexity": perplexity,
@@ -109,9 +145,31 @@ def _evaluate_training_shards(
             f"loss={loss:.6f} perplexity={perplexity:.6f} elapsed={elapsed:.1f}s"
         )
 
-    output_path = run_dir / "metrics" / "eval.csv"
-    _write_rows(output_path, ["run_id", "client_id", "loss", "perplexity"], rows)
+    output_path = run_dir / "metrics" / _output_filename("train", model_mode)
+    _write_rows(
+        output_path,
+        ["run_id", "model_mode", "client_id", "loss", "perplexity"],
+        rows,
+    )
     print(f"[evaluate] 全部完成: 结果已保存到 {output_path}")
+
+
+def _add_model_mode(
+    fieldnames: list[str],
+    rows: list[dict],
+    model_mode: str,
+) -> tuple[list[str], list[dict]]:
+    output_fieldnames = list(fieldnames)
+    if "model_mode" not in output_fieldnames:
+        output_fieldnames.insert(1, "model_mode")
+    output_rows = [{**row, "model_mode": model_mode} for row in rows]
+    return output_fieldnames, output_rows
+
+
+def _output_filename(target: str, model_mode: str) -> str:
+    stem = "eval" if target == "train" else target
+    suffix = "_base" if model_mode == "base" else ""
+    return f"{stem}{suffix}.csv"
 
 
 def _write_rows(path: Path, fieldnames: list[str], rows: list[dict]) -> None:

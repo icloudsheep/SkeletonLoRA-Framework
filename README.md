@@ -13,15 +13,15 @@
 
 ## 配置基准
 
-`configs/default.yaml` 和 `configs/loss.yaml` 都是后续实验的基准配置，不代表所有任务的最终参数：
+`configs/default.yaml` 和 `configs/loss.yaml` 都是后续实验的基准配置，不代表所有任务的最终参数。YAML 文件是参数的唯一真相源，下表仅记录当前基准快照：
 
-| 配置 | 基准用途 |
-|---|---|
-| `configs/default.yaml` | OpenLLaMA 3B + MMLU auxiliary train 的常规联邦训练基准 |
-| `configs/loss.yaml` | OpenLLaMA 3B + Super-NaturalInstructions 的多客户端、多 round 收敛基准 |
-| `configs/smoke.yaml` | dummy 模型和数据的快速回归测试 |
+| 配置 | 基准用途 | 当前关键参数 |
+|---|---|---|
+| `configs/default.yaml` | OpenLLaMA 3B + MMLU auxiliary train 的常规联邦训练基准 | 4 clients、3 rounds、300 local steps、batch 4、LoRA rank 4、max length 512 |
+| `configs/loss.yaml` | OpenLLaMA 3B + Super-NaturalInstructions 的收敛基准 | 2 clients、20 rounds、300 local steps、batch 4、LoRA rank 4、max length 512、最多 20000 samples |
+| `configs/smoke.yaml` | dummy 模型和数据的快速回归测试 | 以 YAML 为准 |
 
-新任务应从最接近的基准复制并派生独立配置，明确记录客户端数、round 数、local steps、数据量、序列长度、LoRA rank 和加密参数。运行时向脚本显式传入任务配置：
+修改 `default.yaml` 或 `loss.yaml` 的基准实验语义时，应同步更新上表；普通派生任务只需维护自己的 YAML，无需反向修改基准说明。新任务应从最接近的基准复制并派生独立配置，明确记录客户端数、round 数、local steps、数据量、序列长度、LoRA rank 和加密参数。运行时向脚本显式传入任务配置：
 
 ```bash
 bash run.sh configs/<task>.yaml
@@ -146,9 +146,13 @@ bash evaluate.sh configs/<task>.yaml <run_id> mmlu
 
 # GSM8K 贪心生成后的最终数值 exact match
 bash evaluate.sh configs/<task>.yaml <run_id> gsm8k
+
+# 不加载 LoRA，直接评测原始底座模型
+bash evaluate.sh configs/<task>.yaml <run_id> mmlu base
+bash evaluate.sh configs/<task>.yaml <run_id> gsm8k base
 ```
 
-专业评测的数据路径和生成长度由 `configs/evaluation.yaml` 控制。结果分别写入 `metrics/eval.csv`、`metrics/mmlu.csv` 或 `metrics/gsm8k.csv`。MMLU CSV 包含总正确率、分学科正确率和逐题结果。
+默认 `model-mode` 为 `adapter`，会加载该 run 的 `final/adapter_model.safetensors`。`base` 模式只加载配置中的本地底座模型，不读取 checkpoint；`run_id` 仅用于确定结果目录，从而把同一实验的底座分数和 LoRA 分数放在一起比较。原生结果分别写入 `metrics/eval_base.csv`、`metrics/mmlu_base.csv` 或 `metrics/gsm8k_base.csv`，CSV 的 `model_mode` 列会明确标记模型模式。专业评测的数据路径和生成长度由 `configs/evaluation.yaml` 控制。MMLU CSV 包含总正确率、分学科正确率和逐题结果。
 
 ## 加解密接口
 
