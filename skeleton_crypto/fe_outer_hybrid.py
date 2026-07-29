@@ -53,16 +53,30 @@ def _split(base, encrypted, selected, split_encryption):
     return groups
 
 
-def _split_by_slots(indices, row_count, max_slots):
+def _split_matrix_by_slots(rows, cols, max_slots):
+    rows = np.asarray(rows, dtype=int)
+    cols = np.asarray(cols, dtype=int)
     if max_slots is None:
-        return [np.asarray(indices, dtype=int)]
-    if row_count <= 0 or row_count > max_slots:
-        raise ValueError(
-            f"结果块行数 {row_count} 无法放入 {max_slots} 个 CKKS 槽位"
+        return [(rows, cols)]
+    if rows.size == 0 or cols.size == 0 or max_slots <= 0:
+        raise ValueError("结果块维度和 CKKS 槽位数必须为正数")
+
+    candidates = []
+    for row_size in range(1, min(rows.size, max_slots) + 1):
+        col_size = min(cols.size, max_slots // row_size)
+        if col_size == 0:
+            continue
+        row_groups = (rows.size + row_size - 1) // row_size
+        col_groups = (cols.size + col_size - 1) // col_size
+        candidates.append(
+            (row_groups * col_groups, -(row_size * col_size), row_size, col_size)
         )
-    group_size = max(1, max_slots // row_count)
-    indices = np.asarray(indices, dtype=int)
-    return [indices[start:start + group_size] for start in range(0, len(indices), group_size)]
+    _, _, row_size, col_size = min(candidates)
+    return [
+        (rows[row_start:row_start + row_size], cols[col_start:col_start + col_size])
+        for row_start in range(0, rows.size, row_size)
+        for col_start in range(0, cols.size, col_size)
+    ]
 
 
 def build_blocks(out_features, in_features, partition: ModePartition, skeleton,
@@ -87,13 +101,17 @@ def build_blocks(out_features, in_features, partition: ModePartition, skeleton,
     blocks = []
     for rows, rows_selected, rows_encrypted in row_groups:
         for col_group, cols_selected, cols_encrypted in col_groups:
-            for cols in _split_by_slots(col_group, rows.size, max_slots):
+            block_uses_ckks = rows_encrypted or cols_encrypted
+            block_max_slots = max_slots if block_uses_ckks else None
+            for block_rows, block_cols in _split_matrix_by_slots(
+                rows, col_group, block_max_slots
+            ):
                 if skeleton and not rows_selected and not cols_selected:
                     continue
                 blocks.append(
                     Block(
-                        row_indices=rows,
-                        col_indices=cols,
+                        row_indices=block_rows,
+                        col_indices=block_cols,
                         rows_selected=rows_selected,
                         cols_selected=cols_selected,
                         b_encrypted=rows_encrypted,

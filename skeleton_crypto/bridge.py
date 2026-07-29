@@ -2,36 +2,39 @@
 
 from __future__ import annotations
 
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, as_completed, wait
-from contextlib import contextmanager
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    Future,
+    ProcessPoolExecutor,
+    wait,
+)
 from dataclasses import dataclass
 import math
+import multiprocessing
 import os
 import pickle
+import queue
 import resource
 import sys
-import threading
 import time
 from typing import Any, Callable
 
 import numpy as np
 import torch
 
-from skeleton_crypto.fe_context import clone_context, create_secret_context, derive_public_context
+from skeleton_crypto.fe_context import create_secret_context, derive_public_context
 from skeleton_crypto.fe_modes import build_partition
 from skeleton_crypto.fe_outer_hybrid import (
-    accumulate_block,
-    accumulate_serialized,
     aggregate,
     build_blocks,
-    decrypt_block,
     decrypt_result,
     encrypt_upload,
-    finalize_block,
-    iter_block_uploads,
-    serialize_accumulated,
 )
 from skeleton_crypto.fe_skeleton import cur_reconstruct_with_stats, select_uniform_rect_indices
+from skeleton_crypto.process_worker import (
+    aggregate_layer_process,
+    initialize_process_worker,
+)
 from utils import factorize_lora_product
 
 
@@ -51,245 +54,6 @@ class CryptoConfig:
     max_workers: int
     worker_reserve_bytes: int
     max_system_memory_ratio: float
-
-
-class _WorkerMemoryGate:
-    """按 RSS 预算限制并行任务的实际活跃数量。"""
-
-    def __init__(
-        self,
-        max_workers: int,
-        memory_limit_bytes: int,
-        worker_reserve_bytes: int,
-        admission_limit_bytes: int | None = None,
-    ) -> None:
-        self.requested_workers = max_workers
-        self.current_worker_limit = max_workers
-        self.memory_limit_bytes = memory_limit_bytes
-        self.admission_limit_bytes = min(
-            memory_limit_bytes,
-            (
-                memory_limit_bytes
-                if admission_limit_bytes is None
-                else admission_limit_bytes
-            ),
-        )
-        self.worker_reserve_bytes = max(1, int(worker_reserve_bytes))
-        self._baseline_rss_bytes = _current_rss_bytes()
-        self._condition = threading.Condition()
-        self._active_workers = 0
-        self._active_slots: set[int] = set()
-        self._reserved_bytes = 0
-        self.peak_active_workers = 0
-        self.memory_wait_count = 0
-        self.worker_downgrade_count = 0
-        self.min_workers = max_workers
-        self._cancelled = False
-
-    @contextmanager
-    def task(self, reserve_bytes: int):
-        worker_slot = self._acquire(reserve_bytes, uses_worker=True)
-        try:
-            yield worker_slot
-            self._ensure_within_limit()
-        finally:
-            self._release(reserve_bytes, uses_worker=True, worker_slot=worker_slot)
-
-    @contextmanager
-    def reserve(self, reserve_bytes: int):
-        self._acquire(reserve_bytes, uses_worker=False)
-        try:
-            yield
-            self._ensure_within_limit()
-        finally:
-            self._release(reserve_bytes, uses_worker=False, worker_slot=None)
-
-    def checkpoint(self) -> None:
-        """刷新 RSS 和 worker 上限，并在触及硬上限时终止计算。"""
-        with self._condition:
-            self._raise_if_cancelled()
-            current = _current_rss_bytes()
-            self._ensure_within_limit(current)
-            self._refresh_worker_limit(current)
-
-    @property
-    def active_workers(self) -> int:
-        with self._condition:
-            return self._active_workers
-
-    @property
-    def reserved_bytes(self) -> int:
-        with self._condition:
-            return self._reserved_bytes
-
-    def cancel(self) -> None:
-        with self._condition:
-            self._cancelled = True
-            self._condition.notify_all()
-
-    def _acquire(
-        self,
-        reserve_bytes: int,
-        *,
-        uses_worker: bool,
-    ) -> int | None:
-        reserve_bytes = max(0, int(reserve_bytes))
-        # layer reserve 持有期间会等待子任务；准入时额外检查一个 worker
-        # 配额，确保至少一个子任务始终可以继续推进。
-        gate_worker_reserve = 0 if uses_worker else self.worker_reserve_bytes
-        with self._condition:
-            waited_for_memory = False
-            while True:
-                self._raise_if_cancelled()
-                current = _current_rss_bytes()
-                self._ensure_within_limit(current)
-                self._refresh_worker_limit(current)
-                committed = max(
-                    current,
-                    self._baseline_rss_bytes
-                    + self._reserved_bytes
-                    + self._active_workers * self.worker_reserve_bytes,
-                )
-                projected = (
-                    committed
-                    + reserve_bytes
-                    + gate_worker_reserve
-                    + int(uses_worker) * self.worker_reserve_bytes
-                )
-                worker_available = (
-                    not uses_worker
-                    or (
-                        self._active_workers < self.current_worker_limit
-                        and any(
-                            slot not in self._active_slots
-                            for slot in range(self.current_worker_limit)
-                        )
-                    )
-                )
-                memory_available = projected <= self.admission_limit_bytes
-                progress_worker = (
-                    uses_worker
-                    and self._active_workers == 0
-                    and projected <= self.memory_limit_bytes
-                )
-                if worker_available and (memory_available or progress_worker):
-                    break
-                if (
-                    not memory_available
-                    and self._reserved_bytes == 0
-                    and self._active_workers == 0
-                ):
-                    raise MemoryError(
-                        "单个任务的预计 RSS "
-                        f"{_format_bytes(projected)} "
-                        "超过并行准入上限 "
-                        f"{_format_bytes(self.admission_limit_bytes)}"
-                    )
-                waited_for_memory = waited_for_memory or not memory_available
-                self._condition.wait(timeout=0.05)
-            if waited_for_memory:
-                self.memory_wait_count += 1
-            worker_slot = None
-            if uses_worker:
-                worker_slot = next(
-                    slot
-                    for slot in range(self.current_worker_limit)
-                    if slot not in self._active_slots
-                )
-                self._active_slots.add(worker_slot)
-                self._active_workers += 1
-            self._reserved_bytes += reserve_bytes
-            self.peak_active_workers = max(
-                self.peak_active_workers, self._active_workers
-            )
-            return worker_slot
-
-    def _release(
-        self,
-        reserve_bytes: int,
-        *,
-        uses_worker: bool,
-        worker_slot: int | None,
-    ) -> None:
-        reserve_bytes = max(0, int(reserve_bytes))
-        with self._condition:
-            if uses_worker:
-                if worker_slot is None or worker_slot not in self._active_slots:
-                    raise RuntimeError("并行内存门控 worker 槽位失衡")
-                self._active_slots.remove(worker_slot)
-                self._active_workers -= 1
-            self._reserved_bytes -= reserve_bytes
-            if (
-                self._active_workers < 0
-                or self._reserved_bytes < 0
-            ):
-                raise RuntimeError("并行内存门控计数失衡")
-            self._condition.notify_all()
-
-    def _refresh_worker_limit(self, current_rss_bytes: int) -> None:
-        committed = max(
-            current_rss_bytes,
-            self._baseline_rss_bytes
-            + self._reserved_bytes
-            + self._active_workers * self.worker_reserve_bytes,
-        )
-        available = max(0, self.admission_limit_bytes - committed)
-        additional_workers = int(available // self.worker_reserve_bytes)
-        target = max(
-            1,
-            self._active_workers,
-            min(
-                self.requested_workers,
-                self._active_workers + additional_workers,
-            ),
-        )
-        if target < self.current_worker_limit:
-            self.min_workers = min(self.min_workers, target)
-            self.worker_downgrade_count += 1
-        if target != self.current_worker_limit:
-            self.current_worker_limit = target
-            self._condition.notify_all()
-
-    def _ensure_within_limit(self, current: int | None = None) -> None:
-        current = _current_rss_bytes() if current is None else current
-        if current > self.memory_limit_bytes:
-            raise MemoryError(
-                f"当前 RSS {_format_bytes(current)} 超过内存上限 "
-                f"{_format_bytes(self.memory_limit_bytes)}"
-            )
-
-    def _raise_if_cancelled(self) -> None:
-        if self._cancelled:
-            raise RuntimeError("CKKS 并行聚合已取消")
-
-
-class _ThreadContexts:
-    """为每个受门控的 worker 槽位延迟创建独立 CKKS context。"""
-
-    def __init__(self, public_context, secret_context) -> None:
-        self._public_context = public_context
-        self._secret_context = secret_context
-        self._public_contexts = {}
-        self._secret_contexts = {}
-        self._clone_lock = threading.Lock()
-
-    def public(self, worker_slot: int):
-        if worker_slot not in self._public_contexts:
-            with self._clone_lock:
-                if worker_slot not in self._public_contexts:
-                    self._public_contexts[worker_slot] = clone_context(
-                        self._public_context
-                    )
-        return self._public_contexts[worker_slot]
-
-    def secret(self, worker_slot: int):
-        if worker_slot not in self._secret_contexts:
-            with self._clone_lock:
-                if worker_slot not in self._secret_contexts:
-                    self._secret_contexts[worker_slot] = clone_context(
-                        self._secret_context
-                    )
-        return self._secret_contexts[worker_slot]
 
 
 class SkeletonLoRACrypto:
@@ -398,442 +162,199 @@ class SkeletonLoRACrypto:
         round_id: int,
         progress: Callable[[dict[str, Any]], None] | None = None,
     ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
-        """并行聚合层、块和客户端，并按内存预算限制实际活跃 worker。"""
+        """使用独立进程并行聚合各层，并限制进程总内存。"""
         ordered_plaintexts = sorted(plaintexts, key=lambda item: item[0])
         states = self._validate_plaintexts(ordered_plaintexts)
         layer_keys = sorted(key for key in states[0] if "lora_A" in key)
+        for a_key in layer_keys:
+            b_key = a_key.replace("lora_A", "lora_B", 1)
+            a_tensors = [state[a_key] for state in states]
+            b_tensors = [state[b_key] for state in states]
+            for a_tensor, b_tensor in zip(a_tensors, b_tensors):
+                self._validate_pair(a_key, a_tensor, b_key, b_tensor)
+            self._validate_plain_layer_metadata(
+                a_key, a_tensors, b_key, b_tensors
+            )
         client_stats = {
             client_id: {"encrypt_time": 0.0, "ciphertext_size": 0}
             for client_id, _ in ordered_plaintexts
         }
         output: dict[str, torch.Tensor] = {}
-        observed_peak = _peak_rss_bytes()
+        observed_peak = _aggregate_memory_bytes()
         memory_limit = self._effective_memory_limit()
-        effective_workers = self._effective_worker_count(memory_limit)
-        gate = _WorkerMemoryGate(
-            effective_workers,
-            memory_limit,
-            self.config.worker_reserve_bytes,
-            admission_limit_bytes=int(memory_limit * 0.9),
+        admission_limit = int(memory_limit * 0.9)
+        process_states = {
+            key: [state[key].detach().cpu().numpy() for state in states]
+            for key in states[0]
+        }
+        worker_reserve = self._process_worker_reserve_bytes(process_states)
+        cpu_resources = _cpu_resources()
+        effective_workers = min(
+            len(layer_keys),
+            self._effective_worker_count(
+                memory_limit,
+                worker_reserve_bytes=worker_reserve,
+                cpu_limit=cpu_resources[3],
+            ),
         )
-        contexts = _ThreadContexts(self.public_context, self.secret_context)
-        layer_workers = min(effective_workers, len(layer_keys))
-        block_window = max(1, effective_workers // layer_workers)
-        stop_event = threading.Event()
+        worker_config = {
+            "mode": self.config.mode,
+            "ratio": self.config.ratio,
+            "skeleton": self.config.skeleton,
+            "skeleton_rank": self.config.skeleton_rank,
+            "poly_modulus_degree": self.config.poly_modulus_degree,
+            "cur_condition_threshold": self.config.cur_condition_threshold,
+            "progress_interval_blocks": self.config.progress_interval_blocks,
+        }
+        public_context = self.public_context.serialize()
+        secret_context = self.secret_context.serialize(save_secret_key=True)
         self._emit(
             progress,
             event="parallel_start",
+            backend="process",
             requested_workers=self.config.max_workers,
             effective_workers=effective_workers,
-            layer_workers=layer_workers,
+            layer_workers=effective_workers,
+            worker_reserve_bytes=worker_reserve,
+            admission_limit_bytes=admission_limit,
             memory_limit_bytes=memory_limit,
-            rss_bytes=_current_rss_bytes(),
+            rss_bytes=_aggregate_memory_bytes(),
             peak_rss_bytes=observed_peak,
+            host_cpu_count=cpu_resources[0],
+            affinity_cpu_count=cpu_resources[1],
+            cpu_quota_label=cpu_resources[2],
         )
-
-        layer_pool = ThreadPoolExecutor(
-            max_workers=layer_workers,
-            thread_name_prefix="ckks-layer",
-        )
-        block_pool = ThreadPoolExecutor(
+        process_context = multiprocessing.get_context("spawn")
+        progress_queue = process_context.Queue()
+        layer_pool = ProcessPoolExecutor(
             max_workers=effective_workers,
-            thread_name_prefix="ckks-block",
+            mp_context=process_context,
+            initializer=initialize_process_worker,
+            initargs=(
+                process_states,
+                worker_config,
+                self.rank,
+                self.num_clients,
+                public_context,
+                secret_context,
+                progress_queue,
+                memory_limit,
+            ),
         )
-        client_pool = ThreadPoolExecutor(
-            max_workers=effective_workers,
-            thread_name_prefix="ckks-client",
-        )
+        layer_tasks = list(enumerate(layer_keys, start=1))
         layer_futures: dict[Future, str] = {}
+        next_layer = 0
+        minimum_workers = effective_workers
+        peak_active_workers = 0
+        peak_inflight_layers = 0
+        worker_downgrade_count = 0
+        memory_wait_count = 0
+        active_worker_pids: set[int] = set()
+
+        def drain_progress() -> None:
+            nonlocal observed_peak, peak_active_workers
+            while True:
+                try:
+                    event = progress_queue.get_nowait()
+                except queue.Empty:
+                    return
+                observed_peak = max(observed_peak, event["peak_rss_bytes"])
+                worker_pid = event.get("worker_pid")
+                if event["event"] == "layer_start" and worker_pid is not None:
+                    active_worker_pids.add(worker_pid)
+                    peak_active_workers = max(
+                        peak_active_workers, len(active_worker_pids)
+                    )
+                elif event["event"] == "layer_complete" and worker_pid is not None:
+                    active_worker_pids.discard(worker_pid)
+                self._emit(progress, **event)
+
+        def dispatch_layers() -> None:
+            nonlocal next_layer, minimum_workers, peak_inflight_layers
+            nonlocal worker_downgrade_count
+            current = _aggregate_memory_bytes()
+            available = max(0, admission_limit - current)
+            allowed = max(1, min(effective_workers, available // worker_reserve))
+            allowed = int(allowed)
+            if allowed < minimum_workers:
+                minimum_workers = allowed
+                worker_downgrade_count += 1
+            while next_layer < len(layer_tasks) and len(layer_futures) < allowed:
+                layer_index, a_key = layer_tasks[next_layer]
+                future = layer_pool.submit(
+                    aggregate_layer_process,
+                    (layer_index, len(layer_keys), a_key),
+                )
+                layer_futures[future] = a_key
+                next_layer += 1
+            peak_inflight_layers = max(peak_inflight_layers, len(layer_futures))
+
         try:
-            layer_futures = {
-                layer_pool.submit(
-                    self._aggregate_streaming_layer,
-                    layer_index,
-                    len(layer_keys),
-                    a_key,
-                    states,
-                    ordered_plaintexts,
-                    block_pool,
-                    client_pool,
-                    gate,
-                    contexts,
-                    block_window,
-                    stop_event,
-                    progress,
-                ): a_key
-                for layer_index, a_key in enumerate(layer_keys, start=1)
-            }
-            for future in as_completed(layer_futures):
-                a_key, b_key, a_new, b_new, layer_stats = future.result()
-                output[a_key] = a_new
-                output[b_key] = b_new
-                for client_id, values in layer_stats.items():
-                    client_stats[client_id]["encrypt_time"] += values["encrypt_time"]
-                    client_stats[client_id]["ciphertext_size"] += values["ciphertext_size"]
-                observed_peak = max(observed_peak, _peak_rss_bytes())
+            dispatch_layers()
+            while layer_futures:
+                completed, _ = wait(
+                    layer_futures,
+                    timeout=0.1,
+                    return_when=FIRST_COMPLETED,
+                )
+                drain_progress()
+                for future in completed:
+                    layer_futures.pop(future)
+                    result = future.result()
+                    a_key = result["a_key"]
+                    b_key = result["b_key"]
+                    output[a_key] = torch.from_numpy(result["a_new"]).to(
+                        dtype=states[0][a_key].dtype
+                    )
+                    output[b_key] = torch.from_numpy(result["b_new"]).to(
+                        dtype=states[0][b_key].dtype
+                    )
+                    for client_id, values in result["client_stats"].items():
+                        client_id = int(client_id)
+                        client_stats[client_id]["encrypt_time"] += values["encrypt_time"]
+                        client_stats[client_id]["ciphertext_size"] += values["ciphertext_size"]
+                    observed_peak = max(
+                        observed_peak,
+                        result["peak_memory_bytes"],
+                        _aggregate_memory_bytes(),
+                    )
+                if completed:
+                    dispatch_layers()
+                elif _aggregate_memory_bytes() >= admission_limit:
+                    memory_wait_count += 1
+            for _ in range(10):
+                drain_progress()
+                if progress_queue.empty():
+                    break
+                time.sleep(0.01)
         except BaseException:
-            stop_event.set()
-            gate.cancel()
             for future in layer_futures:
                 future.cancel()
             raise
         finally:
-            stop_event.set()
-            gate.cancel()
             layer_pool.shutdown(wait=True, cancel_futures=True)
-            block_pool.shutdown(wait=True, cancel_futures=True)
-            client_pool.shutdown(wait=True, cancel_futures=True)
+            progress_queue.close()
+            progress_queue.join_thread()
 
+        observed_peak = max(observed_peak, _aggregate_memory_bytes())
         return output, {
             "strategy": self.config.memory_strategy,
             "clients": client_stats,
             "peak_rss_bytes": observed_peak,
             "parallel": {
+                "backend": "process",
                 "requested_workers": self.config.max_workers,
                 "effective_workers": effective_workers,
-                "peak_active_workers": gate.peak_active_workers,
-                "minimum_workers": gate.min_workers,
-                "worker_downgrade_count": gate.worker_downgrade_count,
-                "memory_wait_count": gate.memory_wait_count,
+                "peak_active_workers": peak_active_workers,
+                "peak_inflight_layers": peak_inflight_layers,
+                "minimum_workers": minimum_workers,
+                "worker_downgrade_count": worker_downgrade_count,
+                "memory_wait_count": memory_wait_count,
+                "worker_reserve_bytes": worker_reserve,
+                "admission_limit_bytes": admission_limit,
                 "memory_limit_bytes": memory_limit,
             },
         }
-
-    def _aggregate_streaming_layer(
-        self,
-        layer_index,
-        layer_count,
-        a_key,
-        states,
-        ordered_plaintexts,
-        block_pool,
-        client_pool,
-        gate,
-        contexts,
-        block_window,
-        stop_event,
-        progress,
-    ):
-        b_key = a_key.replace("lora_A", "lora_B", 1)
-        a_tensors = [state[a_key] for state in states]
-        b_tensors = [state[b_key] for state in states]
-        for a_tensor, b_tensor in zip(a_tensors, b_tensors):
-            self._validate_pair(a_key, a_tensor, b_key, b_tensor)
-        self._validate_plain_layer_metadata(a_key, a_tensors, b_key, b_tensors)
-
-        out_features = b_tensors[0].shape[0]
-        in_features = a_tensors[0].shape[1]
-        self._emit(
-            progress,
-            event="layer_prepare_start",
-            layer=a_key,
-            layer_index=layer_index,
-            layer_count=layer_count,
-            rss_bytes=_current_rss_bytes(),
-            peak_rss_bytes=_peak_rss_bytes(),
-        )
-        prepare_started = time.perf_counter()
-        rows, cols = self._skeleton_indices(out_features, in_features)
-        partition = build_partition(
-            out_features, in_features, self.config.mode, self.config.ratio
-        )
-        blocks = build_blocks(
-            out_features,
-            in_features,
-            partition,
-            self.config.skeleton,
-            skeleton_rows=rows,
-            skeleton_cols=cols,
-            max_slots=self.config.poly_modulus_degree // 2,
-        )
-        self._emit(
-            progress,
-            event="layer_prepare_complete",
-            layer=a_key,
-            layer_index=layer_index,
-            layer_count=layer_count,
-            block_count=len(blocks),
-            prepare_time=time.perf_counter() - prepare_started,
-            rss_bytes=_current_rss_bytes(),
-            peak_rss_bytes=_peak_rss_bytes(),
-        )
-        max_block_reserve = max(self._block_reserve_bytes(block) for block in blocks)
-        if self.config.skeleton:
-            layer_buffer_bytes = (
-                out_features * cols.size + rows.size * in_features
-            ) * np.dtype(np.float32).itemsize
-        else:
-            layer_buffer_bytes = (
-                out_features * in_features * np.dtype(np.float32).itemsize
-            )
-        block_window_reserve = max_block_reserve * block_window
-        if self.config.skeleton:
-            reconstruction_reserve = self._reconstruction_reserve_bytes(
-                out_features, in_features, rows.size, cols.size
-            )
-        else:
-            reconstruction_reserve = 0
-        factorization_reserve = self._factorization_reserve_bytes(
-            out_features, in_features
-        )
-        layer_reserve = layer_buffer_bytes + block_window_reserve + max(
-            reconstruction_reserve, factorization_reserve
-        )
-        with gate.reserve(layer_reserve):
-            if self.config.skeleton:
-                cross_columns = np.zeros((out_features, cols.size), dtype=np.float32)
-                cross_rows = np.zeros((rows.size, in_features), dtype=np.float32)
-                product = None
-            else:
-                product = np.zeros((out_features, in_features), dtype=np.float32)
-                cross_columns = cross_rows = None
-            return self._process_streaming_layer(
-                layer_index,
-                layer_count,
-                a_key,
-                b_key,
-                a_tensors,
-                b_tensors,
-                ordered_plaintexts,
-                rows,
-                cols,
-                blocks,
-                product,
-                cross_columns,
-                cross_rows,
-                block_pool,
-                client_pool,
-                gate,
-                contexts,
-                block_window,
-                stop_event,
-                progress,
-            )
-
-    def _process_streaming_layer(
-        self,
-        layer_index,
-        layer_count,
-        a_key,
-        b_key,
-        a_tensors,
-        b_tensors,
-        ordered_plaintexts,
-        rows,
-        cols,
-        blocks,
-        product,
-        cross_columns,
-        cross_rows,
-        block_pool,
-        client_pool,
-        gate,
-        contexts,
-        block_window,
-        stop_event,
-        progress,
-    ):
-        row_positions = {int(value): index for index, value in enumerate(rows)}
-        col_positions = {int(value): index for index, value in enumerate(cols)}
-        self._emit(
-            progress,
-            event="layer_start",
-            layer=a_key,
-            layer_index=layer_index,
-            layer_count=layer_count,
-            block_count=len(blocks),
-            rss_bytes=_current_rss_bytes(),
-            peak_rss_bytes=_peak_rss_bytes(),
-        )
-        layer_stats = {
-            client_id: {"encrypt_time": 0.0, "ciphertext_size": 0}
-            for client_id, _ in ordered_plaintexts
-        }
-        pending: dict[Future, int] = {}
-        next_block = 0
-        try:
-            while next_block < len(blocks) or pending:
-                if stop_event.is_set():
-                    raise RuntimeError("CKKS 并行聚合已取消")
-                while next_block < len(blocks) and len(pending) < block_window:
-                    block = blocks[next_block]
-                    future = block_pool.submit(
-                        self._aggregate_streaming_block,
-                        block,
-                        ordered_plaintexts,
-                        a_tensors,
-                        b_tensors,
-                        client_pool,
-                        gate,
-                        contexts,
-                        stop_event,
-                    )
-                    pending[future] = next_block + 1
-                    next_block += 1
-                completed, _ = wait(pending, return_when=FIRST_COMPLETED)
-                for future in completed:
-                    block_index = pending.pop(future)
-                    block, block_matrix, block_stats = future.result()
-                    if product is not None:
-                        product[np.ix_(block.row_indices, block.col_indices)] = block_matrix
-                    else:
-                        if block.cols_selected:
-                            selected_cols = [
-                                col_positions[int(value)] for value in block.col_indices
-                            ]
-                            cross_columns[
-                                np.ix_(block.row_indices, selected_cols)
-                            ] = block_matrix
-                        if block.rows_selected:
-                            selected_rows = [
-                                row_positions[int(value)] for value in block.row_indices
-                            ]
-                            cross_rows[
-                                np.ix_(selected_rows, block.col_indices)
-                            ] = block_matrix
-                    for client_id, values in block_stats.items():
-                        layer_stats[client_id]["encrypt_time"] += values["encrypt_time"]
-                        layer_stats[client_id]["ciphertext_size"] += values["ciphertext_size"]
-                    if self._should_report_block(block_index, len(blocks)):
-                        self._emit(
-                            progress,
-                            event="block_complete",
-                            layer=a_key,
-                            layer_index=layer_index,
-                            layer_count=layer_count,
-                            block_index=block_index,
-                            block_count=len(blocks),
-                            rss_bytes=_current_rss_bytes(),
-                            peak_rss_bytes=_peak_rss_bytes(),
-                        )
-        except BaseException:
-            stop_event.set()
-            for future in pending:
-                future.cancel()
-            raise
-
-        if product is None:
-            with gate.task(0):
-                product, ok, reconstruction_stats = cur_reconstruct_with_stats(
-                    cross_columns,
-                    cross_rows,
-                    rows,
-                    cols,
-                    condition_threshold=self.config.cur_condition_threshold,
-                )
-            if not ok or product is None:
-                raise RuntimeError(
-                    f"{a_key} 的 CUR 重建失败: "
-                    f"{reconstruction_stats['failure_reason']}"
-                )
-        product_array = np.asarray(product, dtype=np.float32)
-        product_tensor = torch.from_numpy(product_array)
-        with gate.task(0):
-            b_new, a_new = factorize_lora_product(product_tensor, self.rank)
-        a_new = a_new.to(dtype=a_tensors[0].dtype)
-        b_new = b_new.to(dtype=b_tensors[0].dtype)
-        self._emit(
-            progress,
-            event="layer_complete",
-            layer=a_key,
-            layer_index=layer_index,
-            layer_count=layer_count,
-            rss_bytes=_current_rss_bytes(),
-            peak_rss_bytes=_peak_rss_bytes(),
-        )
-        return a_key, b_key, a_new, b_new, layer_stats
-
-    def _aggregate_streaming_block(
-        self,
-        block,
-        ordered_plaintexts,
-        a_tensors,
-        b_tensors,
-        client_pool,
-        gate,
-        contexts,
-        stop_event,
-    ):
-        if stop_event.is_set():
-            raise RuntimeError("CKKS 并行聚合已取消")
-        # layer 准入预算覆盖当前并发窗口中所有 block 的完整生命周期。
-        client_futures = []
-        for (client_id, _), a_tensor, b_tensor in zip(
-            ordered_plaintexts, a_tensors, b_tensors
-        ):
-            client_futures.append(
-                (
-                    client_id,
-                    client_pool.submit(
-                        self._aggregate_client_block,
-                        block,
-                        a_tensor,
-                        b_tensor,
-                        gate,
-                        contexts,
-                        stop_event,
-                    ),
-                )
-            )
-        block_stats = {}
-        try:
-            for client_id, future in client_futures:
-                serialized, values = future.result()
-                block_stats[client_id] = {**values, "serialized": serialized}
-        except BaseException:
-            for _, future in client_futures:
-                future.cancel()
-            raise
-        with gate.task(0) as worker_slot:
-            public_context = contexts.public(worker_slot)
-            accumulated = None
-            for client_id, _ in client_futures:
-                values = block_stats[client_id]
-                accumulated = accumulate_serialized(
-                    accumulated,
-                    values.pop("serialized"),
-                    public_context,
-                )
-                block_stats[client_id] = values
-            block_result = finalize_block(accumulated, block, self.num_clients)
-            values = decrypt_block(block_result, contexts.secret(worker_slot))
-            block_matrix = values.reshape(
-                block.col_indices.size, block.row_indices.size
-            ).T.copy()
-        return block, block_matrix, block_stats
-
-    def _aggregate_client_block(
-        self, block, a_tensor, b_tensor, gate, contexts, stop_event
-    ):
-        if stop_event.is_set():
-            raise RuntimeError("CKKS 并行聚合已取消")
-        # 外层 layer 任务已覆盖 block/client 结果的完整生命周期预算。
-        with gate.task(0) as worker_slot:
-            public_context = contexts.public(worker_slot)
-            iterator = iter_block_uploads(
-                b_tensor.numpy(),
-                a_tensor.numpy(),
-                public_context,
-                self.rank,
-                block,
-            )
-            accumulated = None
-            encrypt_time = 0.0
-            ciphertext_size = 0
-            while True:
-                encrypt_started = time.perf_counter()
-                try:
-                    upload = next(iterator)
-                except StopIteration:
-                    break
-                gate.checkpoint()
-                encrypt_time += time.perf_counter() - encrypt_started
-                ciphertext_size += _upload_size(upload)
-                accumulated = accumulate_block(accumulated, upload, public_context)
-            return serialize_accumulated(accumulated), {
-                "encrypt_time": encrypt_time,
-                "ciphertext_size": ciphertext_size,
-            }
 
     def _block_reserve_bytes(self, block) -> int:
         elements = block.row_indices.size * block.col_indices.size
@@ -914,13 +435,6 @@ class SkeletonLoRACrypto:
                 f"LoRA rank 不匹配: {a_key}={tuple(a_tensor.shape)}, "
                 f"{b_key}={tuple(b_tensor.shape)}, rank={self.rank}"
             )
-        max_slots = self.config.poly_modulus_degree // 2
-        out_features = b_tensor.shape[0]
-        if out_features > max_slots:
-            raise ValueError(
-                f"{b_key} 输出维度 {out_features} 超过 CKKS 槽位数 {max_slots}"
-            )
-
     def _validate_packages(self, ciphertexts: list[tuple[int, dict]], round_id: int) -> list[dict]:
         if len(ciphertexts) != self.num_clients:
             raise ValueError(
@@ -991,21 +505,77 @@ class SkeletonLoRACrypto:
             return system_limit
         return min(system_limit, self.config.max_rss_bytes)
 
-    def _effective_worker_count(self, memory_limit: int) -> int:
-        available = memory_limit - _current_rss_bytes()
-        if available < self.config.worker_reserve_bytes:
+    def _effective_worker_count(
+        self,
+        memory_limit: int,
+        *,
+        worker_reserve_bytes: int | None = None,
+        cpu_limit: int | None = None,
+    ) -> int:
+        reserve = (
+            self.config.worker_reserve_bytes
+            if worker_reserve_bytes is None
+            else int(worker_reserve_bytes)
+        )
+        available = memory_limit - _aggregate_memory_bytes()
+        if available < reserve:
             raise MemoryError(
                 "启动并行 CKKS 所需的单 worker 预留内存不足: "
                 f"available={_format_bytes(max(0, available))}, "
-                f"worker_reserve={_format_bytes(self.config.worker_reserve_bytes)}, "
+                f"worker_reserve={_format_bytes(reserve)}, "
                 f"limit={_format_bytes(memory_limit)}"
             )
-        memory_workers = max(1, available // self.config.worker_reserve_bytes)
-        return min(self.config.max_workers, int(memory_workers))
+        memory_workers = max(1, available // reserve)
+        limits = [self.config.max_workers, int(memory_workers)]
+        if cpu_limit is not None:
+            limits.append(cpu_limit)
+        return min(limits)
 
-    def _should_report_block(self, block_index: int, block_count: int) -> bool:
-        interval = self.config.progress_interval_blocks
-        return block_index == 1 or block_index == block_count or block_index % interval == 0
+    def _process_worker_reserve_bytes(
+        self,
+        states: dict[str, list[np.ndarray]],
+    ) -> int:
+        state_bytes = sum(array.nbytes for arrays in states.values() for array in arrays)
+        largest_layer_reserve = 0
+        for a_key in (key for key in states if "lora_A" in key):
+            b_key = a_key.replace("lora_A", "lora_B", 1)
+            out_features = states[b_key][0].shape[0]
+            in_features = states[a_key][0].shape[1]
+            rows, cols = self._skeleton_indices(out_features, in_features)
+            partition = build_partition(
+                out_features, in_features, self.config.mode, self.config.ratio
+            )
+            blocks = build_blocks(
+                out_features,
+                in_features,
+                partition,
+                self.config.skeleton,
+                skeleton_rows=rows,
+                skeleton_cols=cols,
+                max_slots=self.config.poly_modulus_degree // 2,
+            )
+            layer_buffer_bytes = (
+                out_features * cols.size + rows.size * in_features
+                if self.config.skeleton
+                else out_features * in_features
+            ) * np.dtype(np.float32).itemsize
+            reconstruction_reserve = (
+                self._reconstruction_reserve_bytes(
+                    out_features, in_features, rows.size, cols.size
+                )
+                if self.config.skeleton
+                else 0
+            )
+            factorization_reserve = self._factorization_reserve_bytes(
+                out_features, in_features
+            )
+            layer_reserve = (
+                layer_buffer_bytes
+                + max(self._block_reserve_bytes(block) for block in blocks)
+                + max(reconstruction_reserve, factorization_reserve)
+            )
+            largest_layer_reserve = max(largest_layer_reserve, layer_reserve)
+        return self.config.worker_reserve_bytes + state_bytes + largest_layer_reserve
 
     @staticmethod
     def _emit(progress, **event) -> None:
@@ -1132,6 +702,80 @@ def _current_rss_bytes() -> int:
         except (OSError, ValueError, IndexError):
             pass
     return _peak_rss_bytes()
+
+
+def _aggregate_memory_bytes() -> int:
+    """读取容器当前内存使用量；不可用时退回当前进程 RSS。"""
+    if sys.platform.startswith("linux"):
+        for path in (
+            "/sys/fs/cgroup/memory.current",
+            "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+        ):
+            try:
+                with open(path, encoding="ascii") as usage_file:
+                    return int(usage_file.read().strip())
+            except (OSError, ValueError):
+                continue
+    return _current_rss_bytes()
+
+
+def _cpu_resources() -> tuple[int, int, str, int]:
+    """返回主机、CPU affinity、cgroup quota 和有效 CPU 数。"""
+    host_cpu_count = max(1, os.cpu_count() or 1)
+    try:
+        affinity_cpu_count = max(1, len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):
+        affinity_cpu_count = host_cpu_count
+
+    quota_cores, quota_label = _cgroup_cpu_quota()
+    if quota_cores is None:
+        return (
+            host_cpu_count,
+            affinity_cpu_count,
+            quota_label,
+            affinity_cpu_count,
+        )
+    quota_limit = max(1, math.ceil(quota_cores))
+    return (
+        host_cpu_count,
+        affinity_cpu_count,
+        f"{quota_cores:.2f} cores",
+        min(affinity_cpu_count, quota_limit),
+    )
+
+
+def _cgroup_cpu_quota() -> tuple[float | None, str]:
+    """读取 cgroup v2 或 v1 的 CPU quota 和检测状态。"""
+    try:
+        with open("/sys/fs/cgroup/cpu.max", encoding="ascii") as quota_file:
+            quota_raw, period_raw = quota_file.read().strip().split()
+        if quota_raw == "max":
+            return None, "unlimited"
+        quota = int(quota_raw)
+        period = int(period_raw)
+        if quota > 0 and period > 0:
+            cores = quota / period
+            return cores, f"{cores:.2f} cores"
+    except (OSError, ValueError):
+        pass
+
+    try:
+        with open(
+            "/sys/fs/cgroup/cpu/cpu.cfs_quota_us", encoding="ascii"
+        ) as quota_file:
+            quota = int(quota_file.read().strip())
+        with open(
+            "/sys/fs/cgroup/cpu/cpu.cfs_period_us", encoding="ascii"
+        ) as period_file:
+            period = int(period_file.read().strip())
+        if quota > 0 and period > 0:
+            cores = quota / period
+            return cores, f"{cores:.2f} cores"
+        if quota < 0:
+            return None, "unlimited"
+    except (OSError, ValueError):
+        pass
+    return None, "unavailable"
 
 
 def _total_memory_bytes() -> int:

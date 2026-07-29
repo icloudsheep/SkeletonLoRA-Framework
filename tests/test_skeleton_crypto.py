@@ -1,5 +1,5 @@
+import os
 import pickle
-import threading
 import unittest
 from unittest.mock import patch
 
@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from skeleton_crypto import SkeletonLoRACrypto
-from skeleton_crypto.bridge import _upload_size
+from skeleton_crypto.bridge import _cpu_resources, _upload_size
 from skeleton_crypto.fe_modes import build_partition
 from skeleton_crypto.fe_outer_hybrid import Block, build_blocks
 
@@ -60,6 +60,56 @@ class SkeletonCryptoTest(unittest.TestCase):
                     (block.b_encrypted, block.a_encrypted) for block in blocks
                 }
                 self.assertEqual(actual_flags, expected_flags)
+
+    def test_plain_block_is_not_split_by_ckks_slot_limit(self) -> None:
+        max_slots = 64
+        partition = build_partition(64, 128, "partial_AB", 25)
+        blocks = build_blocks(
+            64,
+            128,
+            partition,
+            skeleton=False,
+            max_slots=max_slots,
+        )
+
+        plain_blocks = [block for block in blocks if not block.encrypted]
+        self.assertEqual(len(plain_blocks), 1)
+        self.assertEqual(plain_blocks[0].row_indices.size, 48)
+        self.assertEqual(plain_blocks[0].col_indices.size, 96)
+        self.assertGreater(
+            plain_blocks[0].row_indices.size * plain_blocks[0].col_indices.size,
+            max_slots,
+        )
+        for block in (item for item in blocks if item.encrypted):
+            self.assertLessEqual(
+                block.row_indices.size * block.col_indices.size,
+                max_slots,
+            )
+
+    def test_encrypted_blocks_use_two_dimensional_slot_tiling(self) -> None:
+        partition = build_partition(48, 96, "full")
+        blocks = build_blocks(
+            48,
+            96,
+            partition,
+            skeleton=False,
+            max_slots=64,
+        )
+
+        self.assertEqual(len(blocks), 72)
+        self.assertEqual(
+            sum(
+                block.row_indices.size * block.col_indices.size
+                for block in blocks
+            ),
+            48 * 96,
+        )
+        self.assertTrue(
+            all(
+                block.row_indices.size * block.col_indices.size <= 64
+                for block in blocks
+            )
+        )
 
     def test_streaming_upload_size_matches_pickle_metric(self) -> None:
         upload = {
@@ -161,9 +211,13 @@ class SkeletonCryptoTest(unittest.TestCase):
                     _config(skeleton=skeleton), num_clients=2, rank=2
                 )
                 events = []
-                streaming, stats = streaming_crypto.secure_aggregate_streaming(
-                    list(enumerate(states)), round_id=3, progress=events.append
-                )
+                with patch(
+                    "skeleton_crypto.bridge._cpu_resources",
+                    return_value=(8, 8, "unlimited", 8),
+                ):
+                    streaming, stats = streaming_crypto.secure_aggregate_streaming(
+                        list(enumerate(states)), round_id=3, progress=events.append
+                    )
 
                 self.assertEqual(set(streaming), set(one_shot))
                 self.assertEqual(stats["strategy"], "layer_block_stream")
@@ -183,23 +237,36 @@ class SkeletonCryptoTest(unittest.TestCase):
                 self.assertEqual(
                     set(stats["parallel"]),
                     {
+                        "backend",
                         "requested_workers",
                         "effective_workers",
                         "peak_active_workers",
+                        "peak_inflight_layers",
                         "minimum_workers",
                         "worker_downgrade_count",
                         "memory_wait_count",
+                        "worker_reserve_bytes",
+                        "admission_limit_bytes",
                         "memory_limit_bytes",
                     },
                 )
-                self.assertGreaterEqual(stats["parallel"]["peak_active_workers"], 2)
+                self.assertEqual(stats["parallel"]["backend"], "process")
+                self.assertGreaterEqual(stats["parallel"]["peak_active_workers"], 1)
+                self.assertGreaterEqual(stats["parallel"]["peak_inflight_layers"], 2)
+                self.assertTrue(
+                    all(
+                        event["worker_pid"] != os.getpid()
+                        for event in events
+                        if event["event"] == "layer_start"
+                    )
+                )
                 for a_key in (key for key in streaming if "lora_A" in key):
                     b_key = a_key.replace("lora_A", "lora_B", 1)
                     actual = (streaming[b_key] @ streaming[a_key]).numpy()
                     expected = (one_shot[b_key] @ one_shot[a_key]).numpy()
                     np.testing.assert_allclose(actual, expected, rtol=3e-3, atol=3e-3)
 
-    def test_streaming_dispatches_all_three_parallel_levels(self) -> None:
+    def test_streaming_dispatches_layers_to_multiple_processes(self) -> None:
         states = []
         for _ in range(2):
             state = {}
@@ -210,44 +277,25 @@ class SkeletonCryptoTest(unittest.TestCase):
         config = _config(skeleton=False)
         config["memory"] = {"max_workers": 4}
         crypto = SkeletonLoRACrypto(config, num_clients=2, rank=2)
-        observed_threads = {"layer": set(), "block": set(), "client": set()}
-        observed_lock = threading.Lock()
-
-        def record_threads(kind, original):
-            def wrapper(*args, **kwargs):
-                with observed_lock:
-                    observed_threads[kind].add(threading.current_thread().name)
-                return original(*args, **kwargs)
-
-            return wrapper
-
-        with (
-            patch.object(
-                crypto,
-                "_aggregate_streaming_layer",
-                new=record_threads("layer", crypto._aggregate_streaming_layer),
-            ),
-            patch.object(
-                crypto,
-                "_aggregate_streaming_block",
-                new=record_threads("block", crypto._aggregate_streaming_block),
-            ),
-            patch.object(
-                crypto,
-                "_aggregate_client_block",
-                new=record_threads("client", crypto._aggregate_client_block),
-            ),
+        events = []
+        with patch(
+            "skeleton_crypto.bridge._cpu_resources",
+            return_value=(8, 8, "unlimited", 8),
         ):
-            crypto.secure_aggregate_streaming(list(enumerate(states)), round_id=1)
-
-        for kind in ("layer", "block", "client"):
-            self.assertTrue(observed_threads[kind])
-            self.assertTrue(
-                all(
-                    name.startswith(f"ckks-{kind}")
-                    for name in observed_threads[kind]
-                )
+            _, stats = crypto.secure_aggregate_streaming(
+                list(enumerate(states)), round_id=1, progress=events.append
             )
+
+        worker_pids = {
+            event["worker_pid"]
+            for event in events
+            if event["event"] == "layer_start"
+        }
+        self.assertTrue(worker_pids)
+        self.assertNotIn(os.getpid(), worker_pids)
+        self.assertEqual(stats["parallel"]["backend"], "process")
+        self.assertGreaterEqual(stats["parallel"]["peak_active_workers"], 1)
+        self.assertGreaterEqual(stats["parallel"]["peak_inflight_layers"], 2)
 
     def test_streaming_rejects_mismatched_client_metadata(self) -> None:
         crypto = SkeletonLoRACrypto(_config(skeleton=False), num_clients=2, rank=2)
@@ -310,6 +358,57 @@ class SkeletonCryptoTest(unittest.TestCase):
                 config["memory"] = {key: value}
                 with self.assertRaisesRegex(ValueError, key):
                     SkeletonLoRACrypto(config, num_clients=1, rank=2)
+
+    def test_cpu_resources_uses_fractional_quota_capacity(self) -> None:
+        with (
+            patch("skeleton_crypto.bridge.os.cpu_count", return_value=32),
+            patch(
+                "skeleton_crypto.bridge.os.sched_getaffinity",
+                return_value=set(range(16)),
+                create=True,
+            ),
+            patch(
+                "skeleton_crypto.bridge._cgroup_cpu_quota",
+                return_value=(2.5, "2.50 cores"),
+            ),
+        ):
+            resources = _cpu_resources()
+
+        self.assertEqual(resources, (32, 16, "2.50 cores", 3))
+
+    def test_cpu_resources_never_exceeds_affinity(self) -> None:
+        with (
+            patch("skeleton_crypto.bridge.os.cpu_count", return_value=32),
+            patch(
+                "skeleton_crypto.bridge.os.sched_getaffinity",
+                return_value={4, 5},
+                create=True,
+            ),
+            patch(
+                "skeleton_crypto.bridge._cgroup_cpu_quota",
+                return_value=(8.0, "8.00 cores"),
+            ),
+        ):
+            resources = _cpu_resources()
+
+        self.assertEqual(resources, (32, 2, "8.00 cores", 2))
+
+    def test_cpu_resources_uses_affinity_without_quota(self) -> None:
+        with (
+            patch("skeleton_crypto.bridge.os.cpu_count", return_value=32),
+            patch(
+                "skeleton_crypto.bridge.os.sched_getaffinity",
+                return_value=set(range(12)),
+                create=True,
+            ),
+            patch(
+                "skeleton_crypto.bridge._cgroup_cpu_quota",
+                return_value=(None, "unlimited"),
+            ),
+        ):
+            resources = _cpu_resources()
+
+        self.assertEqual(resources, (32, 12, "unlimited", 12))
 
     def test_streaming_stops_before_exceeding_memory_budget(self) -> None:
         config = _config(skeleton=False)

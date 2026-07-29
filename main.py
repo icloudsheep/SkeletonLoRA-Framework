@@ -120,48 +120,64 @@ def main() -> None:
             peak_gib = event["peak_rss_bytes"] / 1024 ** 3
             if event["event"] == "parallel_start":
                 logger.info(
-                    "round %d CKKS 并行聚合启动: requested_workers=%d "
-                    "effective_workers=%d layer_workers=%d memory_limit=%.2fGiB "
-                    "rss=%.2fGiB peak_rss=%.2fGiB",
-                    rnd, event["requested_workers"], event["effective_workers"],
-                    event["layer_workers"],
+                    "round %d CKKS 并行聚合启动: backend=%s "
+                    "requested_workers=%d effective_workers=%d "
+                    "worker_reserve=%.2fGiB admission_limit=%.2fGiB "
+                    "memory_limit=%.2fGiB memory_used=%.2fGiB "
+                    "peak_memory=%.2fGiB host_cpus=%d affinity_cpus=%d "
+                    "cpu_quota=%s",
+                    rnd, event["backend"], event["requested_workers"],
+                    event["effective_workers"],
+                    event["worker_reserve_bytes"] / 1024 ** 3,
+                    event["admission_limit_bytes"] / 1024 ** 3,
                     event["memory_limit_bytes"] / 1024 ** 3, rss_gib, peak_gib,
+                    event["host_cpu_count"], event["affinity_cpu_count"],
+                    event["cpu_quota_label"],
                 )
             elif event["event"] == "layer_start":
                 logger.info(
                     "round %d CKKS layer %d/%d 开始: %s blocks=%d "
-                    "rss=%.2fGiB peak_rss=%.2fGiB",
+                    "worker_pid=%d memory_used=%.2fGiB peak_memory=%.2fGiB",
                     rnd, event["layer_index"], event["layer_count"],
-                    event["layer"], event["block_count"], rss_gib, peak_gib,
+                    event["layer"], event["block_count"],
+                    event["worker_pid"], rss_gib, peak_gib,
                 )
             elif event["event"] == "layer_prepare_start":
                 logger.info(
                     "round %d CKKS layer %d/%d 预处理开始: %s "
-                    "rss=%.2fGiB peak_rss=%.2fGiB",
+                    "worker_pid=%d memory_used=%.2fGiB peak_memory=%.2fGiB",
                     rnd, event["layer_index"], event["layer_count"],
-                    event["layer"], rss_gib, peak_gib,
+                    event["layer"], event["worker_pid"], rss_gib, peak_gib,
                 )
             elif event["event"] == "layer_prepare_complete":
                 logger.info(
                     "round %d CKKS layer %d/%d 预处理完成: %s blocks=%d "
-                    "耗时=%.6fs rss=%.2fGiB peak_rss=%.2fGiB",
+                    "耗时=%.6fs worker_pid=%d memory_used=%.2fGiB "
+                    "peak_memory=%.2fGiB",
                     rnd, event["layer_index"], event["layer_count"],
                     event["layer"], event["block_count"],
-                    event["prepare_time"], rss_gib, peak_gib,
+                    event["prepare_time"], event["worker_pid"], rss_gib, peak_gib,
                 )
             elif event["event"] == "block_complete":
                 logger.info(
                     "round %d CKKS layer %d/%d block %d/%d 完成: "
-                    "rss=%.2fGiB peak_rss=%.2fGiB",
+                    "worker_pid=%d elapsed=%.2fs worker_cpu=%.2fs "
+                    "worker_cpu_util=%.1f%% memory_used=%.2fGiB peak_memory=%.2fGiB",
                     rnd, event["layer_index"], event["layer_count"],
-                    event["block_index"], event["block_count"], rss_gib, peak_gib,
+                    event["block_index"], event["block_count"],
+                    event["worker_pid"], event["layer_elapsed"],
+                    event["worker_cpu_seconds"], event["worker_cpu_utilization"],
+                    rss_gib, peak_gib,
                 )
             elif event["event"] == "layer_complete":
                 logger.info(
                     "round %d CKKS layer %d/%d 完成: %s "
-                    "rss=%.2fGiB peak_rss=%.2fGiB",
+                    "worker_pid=%d elapsed=%.2fs worker_cpu_util=%.1f%% "
+                    "memory_used=%.2fGiB peak_memory=%.2fGiB",
                     rnd, event["layer_index"], event["layer_count"],
-                    event["layer"], rss_gib, peak_gib,
+                    event["layer"], event["worker_pid"],
+                    event["layer_elapsed"], event["worker_cpu_utilization"],
+                    rss_gib, peak_gib,
                 )
 
         with perf_timer() as t_agg:
@@ -172,14 +188,15 @@ def main() -> None:
         b_size = sizeof(aggregated)
         logger.info(
             "round %d 聚合完成: strategy=%s 耗时=%.6fs 下发大小=%dB "
-            "peak_rss=%.2fGiB workers=%d/%d minimum_workers=%d "
-            "peak_active=%d worker_downgrades=%d memory_waits=%d",
+            "peak_memory=%.2fGiB workers=%d/%d minimum_workers=%d "
+            "peak_active=%d peak_inflight=%d worker_downgrades=%d memory_waits=%d",
             rnd, crypto_stats["strategy"], t_agg.value, b_size,
             crypto_stats["peak_rss_bytes"] / 1024 ** 3,
             crypto_stats["parallel"]["effective_workers"],
             crypto_stats["parallel"]["requested_workers"],
             crypto_stats["parallel"]["minimum_workers"],
             crypto_stats["parallel"]["peak_active_workers"],
+            crypto_stats["parallel"]["peak_inflight_layers"],
             crypto_stats["parallel"]["worker_downgrade_count"],
             crypto_stats["parallel"]["memory_wait_count"],
         )
