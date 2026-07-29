@@ -8,7 +8,8 @@ import torch
 
 from skeleton_crypto import SkeletonLoRACrypto
 from skeleton_crypto.bridge import _upload_size
-from skeleton_crypto.fe_outer_hybrid import Block
+from skeleton_crypto.fe_modes import build_partition
+from skeleton_crypto.fe_outer_hybrid import Block, build_blocks
 
 
 def _config(
@@ -39,6 +40,27 @@ def _state() -> dict[str, torch.Tensor]:
 
 
 class SkeletonCryptoTest(unittest.TestCase):
+    def test_block_encryption_flags_match_partition_groups(self) -> None:
+        cases = (
+            ("full", None, {(True, True)}),
+            ("partial_A", 25, {(False, True), (False, False)}),
+            (
+                "partial_AB",
+                25,
+                {(True, True), (True, False), (False, True), (False, False)},
+            ),
+        )
+        for mode, ratio, expected_flags in cases:
+            with self.subTest(mode=mode):
+                partition = build_partition(8, 8, mode, ratio)
+                blocks = build_blocks(
+                    8, 8, partition, skeleton=False, max_slots=16
+                )
+                actual_flags = {
+                    (block.b_encrypted, block.a_encrypted) for block in blocks
+                }
+                self.assertEqual(actual_flags, expected_flags)
+
     def test_streaming_upload_size_matches_pickle_metric(self) -> None:
         upload = {
             "kind": "term",
@@ -146,6 +168,17 @@ class SkeletonCryptoTest(unittest.TestCase):
                 self.assertEqual(set(streaming), set(one_shot))
                 self.assertEqual(stats["strategy"], "layer_block_stream")
                 self.assertEqual(events[0]["event"], "parallel_start")
+                self.assertTrue(
+                    any(event["event"] == "layer_prepare_start" for event in events)
+                )
+                self.assertTrue(
+                    any(
+                        event["event"] == "layer_prepare_complete"
+                        and event["block_count"] > 0
+                        and event["prepare_time"] >= 0
+                        for event in events
+                    )
+                )
                 self.assertTrue(any(event["event"] == "block_complete" for event in events))
                 self.assertEqual(
                     set(stats["parallel"]),

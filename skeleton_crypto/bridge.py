@@ -523,6 +523,16 @@ class SkeletonLoRACrypto:
 
         out_features = b_tensors[0].shape[0]
         in_features = a_tensors[0].shape[1]
+        self._emit(
+            progress,
+            event="layer_prepare_start",
+            layer=a_key,
+            layer_index=layer_index,
+            layer_count=layer_count,
+            rss_bytes=_current_rss_bytes(),
+            peak_rss_bytes=_peak_rss_bytes(),
+        )
+        prepare_started = time.perf_counter()
         rows, cols = self._skeleton_indices(out_features, in_features)
         partition = build_partition(
             out_features, in_features, self.config.mode, self.config.ratio
@@ -535,6 +545,17 @@ class SkeletonLoRACrypto:
             skeleton_rows=rows,
             skeleton_cols=cols,
             max_slots=self.config.poly_modulus_degree // 2,
+        )
+        self._emit(
+            progress,
+            event="layer_prepare_complete",
+            layer=a_key,
+            layer_index=layer_index,
+            layer_count=layer_count,
+            block_count=len(blocks),
+            prepare_time=time.perf_counter() - prepare_started,
+            rss_bytes=_current_rss_bytes(),
+            peak_rss_bytes=_peak_rss_bytes(),
         )
         max_block_reserve = max(self._block_reserve_bytes(block) for block in blocks)
         if self.config.skeleton:

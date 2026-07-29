@@ -46,7 +46,10 @@ def _split(base, encrypted, selected, split_encryption):
                 if indices:
                     groups.append((np.array(indices, dtype=int), selected_flag, encrypted_flag))
         else:
-            groups.append((np.array(output_indices, dtype=int), selected_flag, False))
+            encrypted_flag = bool(encrypted.intersection(output_indices))
+            groups.append(
+                (np.array(output_indices, dtype=int), selected_flag, encrypted_flag)
+            )
     return groups
 
 
@@ -82,8 +85,8 @@ def build_blocks(out_features, in_features, partition: ModePartition, skeleton,
         split_encryption=partition.mode in {"partial_A", "partial_AB"},
     )
     blocks = []
-    for rows, rows_selected, _ in row_groups:
-        for col_group, cols_selected, _ in col_groups:
+    for rows, rows_selected, rows_encrypted in row_groups:
+        for col_group, cols_selected, cols_encrypted in col_groups:
             for cols in _split_by_slots(col_group, rows.size, max_slots):
                 if skeleton and not rows_selected and not cols_selected:
                     continue
@@ -93,8 +96,8 @@ def build_blocks(out_features, in_features, partition: ModePartition, skeleton,
                         col_indices=cols,
                         rows_selected=rows_selected,
                         cols_selected=cols_selected,
-                        b_encrypted=any(int(item) in partition.encrypted_rows for item in rows),
-                        a_encrypted=any(int(item) in partition.encrypted_cols for item in cols),
+                        b_encrypted=rows_encrypted,
+                        a_encrypted=cols_encrypted,
                     )
                 )
     if not blocks:

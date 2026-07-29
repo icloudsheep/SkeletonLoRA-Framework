@@ -134,6 +134,21 @@ def main() -> None:
                     rnd, event["layer_index"], event["layer_count"],
                     event["layer"], event["block_count"], rss_gib, peak_gib,
                 )
+            elif event["event"] == "layer_prepare_start":
+                logger.info(
+                    "round %d CKKS layer %d/%d 预处理开始: %s "
+                    "rss=%.2fGiB peak_rss=%.2fGiB",
+                    rnd, event["layer_index"], event["layer_count"],
+                    event["layer"], rss_gib, peak_gib,
+                )
+            elif event["event"] == "layer_prepare_complete":
+                logger.info(
+                    "round %d CKKS layer %d/%d 预处理完成: %s blocks=%d "
+                    "耗时=%.6fs rss=%.2fGiB peak_rss=%.2fGiB",
+                    rnd, event["layer_index"], event["layer_count"],
+                    event["layer"], event["block_count"],
+                    event["prepare_time"], rss_gib, peak_gib,
+                )
             elif event["event"] == "block_complete":
                 logger.info(
                     "round %d CKKS layer %d/%d block %d/%d 完成: "
