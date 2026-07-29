@@ -118,7 +118,16 @@ def main() -> None:
         def report_crypto_progress(event: dict) -> None:
             rss_gib = event["rss_bytes"] / 1024 ** 3
             peak_gib = event["peak_rss_bytes"] / 1024 ** 3
-            if event["event"] == "layer_start":
+            if event["event"] == "parallel_start":
+                logger.info(
+                    "round %d CKKS 并行聚合启动: requested_workers=%d "
+                    "effective_workers=%d layer_workers=%d memory_limit=%.2fGiB "
+                    "rss=%.2fGiB peak_rss=%.2fGiB",
+                    rnd, event["requested_workers"], event["effective_workers"],
+                    event["layer_workers"],
+                    event["memory_limit_bytes"] / 1024 ** 3, rss_gib, peak_gib,
+                )
+            elif event["event"] == "layer_start":
                 logger.info(
                     "round %d CKKS layer %d/%d 开始: %s blocks=%d "
                     "rss=%.2fGiB peak_rss=%.2fGiB",
@@ -148,9 +157,16 @@ def main() -> None:
         b_size = sizeof(aggregated)
         logger.info(
             "round %d 聚合完成: strategy=%s 耗时=%.6fs 下发大小=%dB "
-            "peak_rss=%.2fGiB",
+            "peak_rss=%.2fGiB workers=%d/%d minimum_workers=%d "
+            "peak_active=%d worker_downgrades=%d memory_waits=%d",
             rnd, crypto_stats["strategy"], t_agg.value, b_size,
             crypto_stats["peak_rss_bytes"] / 1024 ** 3,
+            crypto_stats["parallel"]["effective_workers"],
+            crypto_stats["parallel"]["requested_workers"],
+            crypto_stats["parallel"]["minimum_workers"],
+            crypto_stats["parallel"]["peak_active_workers"],
+            crypto_stats["parallel"]["worker_downgrade_count"],
+            crypto_stats["parallel"]["memory_wait_count"],
         )
         tb_w.global_.add_scalar("aggregate_time", t_agg.value, global_step=rnd)
         tb_w.global_.add_scalar("broadcast_size", b_size, global_step=rnd)

@@ -195,6 +195,31 @@ def _serialize_result(value):
     return {"kind": "plain", "payload": np.asarray(value, dtype=np.float64)}
 
 
+def serialize_accumulated(value):
+    """序列化单个 worker 的局部聚合值，隔离不同 worker 的 CKKS context。"""
+    if value is None:
+        raise ValueError("局部聚合状态不能为空")
+    return _serialize_result(value)
+
+
+def accumulate_serialized(accumulated, serialized, public_ctx):
+    """将独立 worker 产生的序列化局部结果合并到当前 CKKS context。"""
+    kind = serialized["kind"]
+    if kind == "ct":
+        current = ts.ckks_vector_from(public_ctx, serialized["payload"])
+    elif kind == "plain":
+        current = np.asarray(serialized["payload"], dtype=np.float64)
+    else:
+        raise ValueError(f"未知局部聚合类型: {kind}")
+    if accumulated is None:
+        return current
+    if isinstance(accumulated, ts.CKKSVector):
+        accumulated += current
+    else:
+        np.add(accumulated, current, out=accumulated)
+    return accumulated
+
+
 def accumulate_block(accumulated, upload, public_ctx):
     """把一个客户端的块上传累加到未解密的服务端块状态。"""
     if upload["kind"] == "plain_product":

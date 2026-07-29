@@ -23,3 +23,8 @@ def derive_public_context(secret_ctx):
     pub = secret_ctx.copy()
     pub.make_context_public()
     return pub
+
+
+def clone_context(ctx):
+    """复制 CKKS context，使并行 worker 不共享可变的 TenSEAL 包装对象。"""
+    return ctx.copy()
