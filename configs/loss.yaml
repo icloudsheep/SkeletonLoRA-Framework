@@ -13,7 +13,7 @@ lora:
   target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
 
 train:
-  batch_size: 4
+  batch_size: 2
   learning_rate: 2.0e-4
   optimizer: adamw
   weight_decay: 0.0
@@ -30,7 +30,7 @@ dataset:
   kind: natural_instructions
   split_method: iid_uniform
   path: ./datasets/natural-instructions
-  max_length: 512
+  max_length: 1024
   max_samples: 20000
 
 logging:
