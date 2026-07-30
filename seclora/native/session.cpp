@@ -361,8 +361,10 @@ SelectiveTwoServerSession::encrypt_client(
         }
         IntMat a = quantize_a(layer);
         IntMat b = quantize_b(layer);
-        const int eb = static_cast<int>(ratio_ * layer.rows);
-        const int ea = static_cast<int>(ratio_ * layer.cols);
+        const int eb = static_cast<int>(
+            std::ceil(ratio_ * static_cast<double>(layer.rows)));
+        const int ea = static_cast<int>(
+            std::ceil(ratio_ * static_cast<double>(layer.cols)));
         const int candidate_count = 2 * num_clients_ * rank_;
         const auto oracle_key =
             std::make_pair(round_id, layer.layer_id);

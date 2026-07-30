@@ -1,4 +1,5 @@
-# End-to-end SecLoRA regression with the repository's dummy model and dataset.
+# Fast SecLoRA regression. It intentionally overrides default.yaml's real
+# model and MMLU dataset while keeping the same secure-aggregation interface.
 
 seed: 42
 
@@ -33,10 +34,10 @@ dataset:
 secure_aggregation:
   backend: seclora
   mode: sel-2s
-  ratio: 0.25
+  ratio: 0.10
   sfp: 12
   xmax: 1.0
-  threads: 4
+  threads: 25
 
 logging:
   level: INFO

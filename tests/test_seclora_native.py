@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import unittest
 
 import numpy as np
@@ -70,8 +71,8 @@ class SecLoRANativeTest(unittest.TestCase):
             skeleton.selected_rank - rank + 1,
         )
         self.assertLessEqual(skeleton.baseline_relative_error, 1e-8)
-        encrypted_rows = int(0.25 * rows)
-        encrypted_cols = int(0.25 * cols)
+        encrypted_rows = math.ceil(0.25 * rows)
+        encrypted_cols = math.ceil(0.25 * cols)
         self.assertEqual(
             skeleton.decrypted_cells,
             skeleton.selected_rank * (encrypted_rows + encrypted_cols),

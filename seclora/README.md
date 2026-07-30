@@ -30,6 +30,8 @@ flag or compact zero encoding is transmitted.
 ## SEL-2S Data Flow
 
 - Quantization is `round(2^sfp * clip(x, -xmax, xmax))`.
+- Protected row/column budgets are `ceil(ratio * rows)` and
+  `ceil(ratio * cols)`.
 - The public BSGS bound is `M = ceil(2^sfp * xmax)^2 * K * R`.
 - `S_P` receives only clear B rows and clear A columns as signed int64 factors.
 - `S_D` receives only PC-DMCFE objects for the protected prefix and the public

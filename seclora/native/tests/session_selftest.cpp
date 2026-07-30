@@ -10,8 +10,8 @@ FloatLayerInput make_layer(int client_id) {
     FloatLayerInput layer;
     layer.layer_id = 0;
     layer.name = "selftest";
-    layer.rows = 12;
-    layer.cols = 12;
+    layer.rows = 10;
+    layer.cols = 11;
     layer.a.resize(2 * layer.cols);
     layer.b.resize(layer.rows * 2);
     if (client_id == 1) return layer;
@@ -43,6 +43,7 @@ int main() {
     const bool passed =
         result.size() == 1 &&
         result[0].selected_rank == 2 &&
+        result[0].decrypted_cells == 12 &&
         result[0].baseline_relative_error <= 1e-8;
     std::printf(
         "SEL-2S PC-DMCFE session: %s (rank=%d, error=%.3e)\n",
