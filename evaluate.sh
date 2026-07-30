@@ -6,13 +6,28 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG="${1:-$ROOT/configs/default.yaml}"
 RUN_ID="${2:-}"
 TARGET="${3:-train}"
-EVALUATION_CONFIG="${4:-$ROOT/configs/evaluation.yaml}"
+FOURTH_ARG="${4:-}"
+FIFTH_ARG="${5:-}"
 EXPECTED_ENV="skeleton_lora_fe"
+
+if [[ "$FOURTH_ARG" == "adapter" || "$FOURTH_ARG" == "base" ]]; then
+    MODEL_MODE="$FOURTH_ARG"
+    EVALUATION_CONFIG="${FIFTH_ARG:-$ROOT/configs/evaluation.yaml}"
+else
+    EVALUATION_CONFIG="${FOURTH_ARG:-$ROOT/configs/evaluation.yaml}"
+    MODEL_MODE="${FIFTH_ARG:-adapter}"
+fi
+
+if [[ "$MODEL_MODE" != "adapter" && "$MODEL_MODE" != "base" ]]; then
+    echo "[evaluate.sh] 错误：model-mode 必须是 adapter 或 base，收到 $MODEL_MODE"
+    exit 1
+fi
 
 if [[ -z "$RUN_ID" ]]; then
     echo "[evaluate.sh] 错误：run-id 不能为空"
-    echo "[evaluate.sh] 用法：bash evaluate.sh [config] <run-id> [train|mmlu|gsm8k] [evaluation-config]"
+    echo "[evaluate.sh] 用法：bash evaluate.sh [config] <run-id> [train|mmlu|gsm8k] [adapter|base] [evaluation-config]"
     echo "[evaluate.sh] 示例：bash evaluate.sh configs/ckks.yaml 2026-07-27_19-31-58 mmlu"
+    echo "[evaluate.sh] 原生：bash evaluate.sh configs/ckks.yaml 2026-07-27_19-31-58 mmlu base"
     exit 1
 fi
 
@@ -54,10 +69,12 @@ echo "[evaluate.sh] python=$PYTHON"
 echo "[evaluate.sh] config=$CONFIG"
 echo "[evaluate.sh] run_id=$RUN_ID"
 echo "[evaluate.sh] target=$TARGET"
+echo "[evaluate.sh] model_mode=$MODEL_MODE"
 echo "[evaluate.sh] evaluation_config=$EVALUATION_CONFIG"
 
 "$PYTHON" "$ROOT/evaluate.py" \
     --config "$CONFIG" \
     --run-id "$RUN_ID" \
     --target "$TARGET" \
+    --model-mode "$MODEL_MODE" \
     --evaluation-config "$EVALUATION_CONFIG"

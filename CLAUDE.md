@@ -1,270 +1,335 @@
-# SkeletonLoRA-Framework
+# SkeletonLoRA-Framework 开发说明
 
-一个预留加解密接口的多客户端联邦 LoRA 微调框架。`main.py` 显性编排整套联邦 LoRA 流程,`client` / `server` 是黑盒,只暴露必要的入参出参函数;加解密与聚合的具体逻辑由用户覆盖对应函数体实现。
+本文档面向后续代码协作者。描述以当前仓库代码为准，重点记录实验语义、模块边界和不可凭空假设的约束。
 
-## 目录结构
+## 必读文档
 
+执行或修改资源下载、训练启动、评估流程之前，必须先阅读 [instruction.md](./instruction.md)。该文档记录 `download.sh`、`run.sh` 和 `evaluate.sh` 的当前参数格式、默认值、资源路径、输出文件及完整调用案例。脚本实现和 YAML 配置仍是最终事实来源；文档与代码不一致时，应先核对实际实现并同步更正文档，不得自行补全不存在的命令、配置或运行行为。
+
+## 项目目标
+
+框架用于单机模拟多客户端联邦 LoRA 微调：只加载一份基座模型，为每个客户端注册独立 adapter；客户端完成本地训练后上传 LoRA 状态，服务端执行解密与聚合，再把聚合结果广播给下一轮的所有客户端。
+
+`main.py` 显式保留联邦流程和加解密钩子。数据编码、训练指标、checkpoint、模型构建和评测分别由独立模块承担。
+
+## 配置原则
+
+`configs/default.yaml` 与 `configs/loss.yaml` 都是基准配置，后续任务必须根据实验目的派生，不应把任一文件解释为所有任务的固定配置。YAML 文件是参数的唯一真相源，下表仅记录当前基准快照。
+
+| 文件 | 基准含义 | 当前关键参数 |
+|---|---|---|
+| `configs/default.yaml` | OpenLLaMA 3B、MMLU auxiliary train、常规联邦训练 | 4 clients、3 rounds、300 local steps、batch 4、LoRA rank 4、max length 512 |
+| `configs/loss.yaml` | OpenLLaMA 3B、Super-NaturalInstructions、收敛实验 | 2 clients、20 rounds、300 local steps、batch 4、LoRA rank 4、max length 512、最多 20000 samples |
+| `configs/smoke.yaml` | dummy 模型与数据的快速端到端回归 | 以 YAML 为准 |
+| `configs/evaluation.yaml` | MMLU/GSM8K 本地路径和评测长度 | 以 YAML 为准 |
+
+修改 `default.yaml` 或 `loss.yaml` 中定义基准实验语义的参数时，必须同步更新上表。普通派生任务只维护自己的配置，不反向修改基准快照。
+
+新增实验配置时，应从最接近的基准派生，并在文件中显式固定：
+
+- 数据集和样本上限；
+- `num_clients`、`num_rounds`、`local_steps`；
+- batch size、学习率、序列长度和 dtype；
+- LoRA rank、alpha 和 target modules；
+- 加密方案及其全部参数；
+- 影响可复现性的 seed。
+
+任务运行时传入明确的派生配置路径：
+
+```bash
+bash run.sh configs/<task>.yaml
 ```
+
+## 当前目录与职责
+
+```text
 SkeletonLoRA-Framework/
-├── main.py                 # 唯一入口,顶部三个 lambda 是全部业务钩子,下面是编排骨架
-├── run.sh                  # 后台起 tensorboard + 跑训练;trap 清理
-├── evaluate.py             # 训练完的跑分入口
-├── overview.md             # 项目需求文档(与用户逐轮澄清的产物)
-├── CLAUDE.md               # 本文档
-│
-├── client/
-│   ├── __init__.py
-│   └── client.py           # 瘦壳,构造时接受 encrypt_fn(由 main 传入)
-├── server/
-│   ├── __init__.py
-│   └── server.py           # 瘦壳,构造时接受 decrypt_fn + aggregate_fn;SVD 已挪到 main
-│
-├── runtime/                # main 的物理拆分,不对外暴露语义
-│   ├── __init__.py
-│   ├── device.py           # pick_device / seed_all
-│   ├── paths.py            # RUN_ID 与目录准备
-│   ├── peft_ops.py         # build_peft_model / 参数遍历工具
-│   ├── loss.py             # compute_loss / move_batch
-│   ├── broadcast.py        # 上一轮聚合结果灌回各 adapter
-│   ├── train_step.py       # 一个客户端一整轮本地训练 + 记录
-│   └── checkpoint.py       # 存 round_XX checkpoint + final 软链
-│
-├── models/
-│   ├── __init__.py         # 按 config.model.kind 分派
-│   ├── dummy.py            # 冒烟用假模型(单层 Linear)
-│   └── open_llama.py       # 真基座模型加载器,从本地路径读取权重
-├── datasets/
-│   ├── __init__.py         # 一次性 build_shards + 每轮 build_dataloader
-│   ├── dummy.py            # 冒烟用随机张量数据集
-│   └── dolly.py            # Dolly 15k 本地加载、causal-LM 编码与 IID 分片
-├── utils/
-│   ├── __init__.py         # 统一导出
-│   ├── logger.py           # Python logging 初始化(INFO+ 落控制台,DEBUG 仅落文件)
-│   ├── timer.py            # perf_timer() 上下文管理器
-│   ├── sizeof.py           # sizeof(obj) = len(pickle.dumps(obj))
-│   ├── lora_product.py     # aggregate_lora_products(state_dicts, rank)
-│   ├── svd.py              # 通用二维张量 SVD 截断工具
-│   ├── metrics.py          # CsvWriters + TbWriters
-│   └── io.py               # yaml / safetensors / raw bytes IO
-├── configs/
-│   ├── smoke.yaml          # dummy 模型 + dummy 数据集,macOS CPU/MPS 秒级跑完
-│   └── default.yaml        # 本地 OpenLLaMA 3B + Databricks Dolly 15k
-│
-├── logs/                   # <RUN_ID>/train.log,只放人读的文本日志
-├── output/                 # <RUN_ID>/{checkpoints,metrics,tensorboard},结构化产物
-└── hf-cache/               # HuggingFace 缓存(可选)
+├── main.py                       联邦训练编排与业务钩子
+├── training_progress.py          当前生效的本地训练与训练指标实现
+├── instruction.md                下载、训练与评估脚本使用速查
+├── run.sh                        环境检查、TensorBoard 和训练启动
+├── evaluate.py                   checkpoint 评估入口
+├── evaluate.sh                   评估环境检查与参数转发
+├── download.sh                   模型、训练集和测试集下载入口
+├── client/                       客户端加密薄壳
+├── server/                       服务端解密/聚合薄壳
+├── runtime/
+│   ├── device.py                 device 选择与随机种子
+│   ├── paths.py                  run_id 和输出目录
+│   ├── peft_ops.py               多 adapter 构建与参数遍历
+│   ├── loss.py                   模型类型对应的 loss 和 batch 搬运
+│   ├── broadcast.py              聚合状态广播
+│   ├── checkpoint.py             round checkpoint 与 final 软链接
+│   └── train_step.py             旧的拆分实现，当前 main.py 未调用
+├── models/                       dummy/OpenLLaMA 模型注册与加载
+├── datasets/                     数据加载、编码、分片和 DataLoader
+├── evaluation/                   MMLU/GSM8K 专业评测
+├── utils/                        日志、计时、指标、聚合和 IO
+├── configs/                      基准及任务配置
+└── tests/                        数据、评测和指标回归测试
 ```
 
-**目录约定**
+修改训练行为时以 `main.py` 实际 import 的 `training_progress.py` 为准。不要只修改 `runtime/train_step.py` 后假定训练行为已经变化。
 
-- `logs/<RUN_ID>/` 与 `output/<RUN_ID>/` 共享同一个 `RUN_ID`(时间戳 `YYYY-MM-DD_HH-MM-SS`,main 启动时算一次)。
-- `output/<RUN_ID>/checkpoints/round_XX/{A.safetensors, B.safetensors, adapter_model.safetensors}`,`final` 是指向最后一轮的 POSIX 软链。
-- CSV 三张表全落在 `output/<RUN_ID>/metrics/`:`step.csv`(每 step 一行)、`round.csv`(每 round × client 一行,服务端字段冗余写)、`grad_norm.csv`(长表)。
+## 联邦状态流转
 
-## 快速开始
+每个 round 的顺序由 `main.py` 固定：
 
-```bash
-# 环境: skeleton_lora_fe conda 环境(python 3.10 + torch/transformers/peft/tensorboard/pandas/pyyaml)
-conda activate skeleton_lora_fe
-
-# 冒烟(dummy 模型 + dummy 数据集,几秒钟跑完)
-./run.sh                                # 等价于 ./run.sh configs/smoke.yaml
-
-# 正式(等 open_llama 权重与数据集接入后)
-./run.sh configs/default.yaml
+```text
+global_state
+  -> broadcast_to_adapters（round 1 的 global_state 为 None，因此跳过）
+  -> client_0 本地训练 -> 加密
+  -> client_1 本地训练 -> 加密
+  -> ...
+  -> server.decrypt_aggregate
+  -> save_round_checkpoint
+  -> global_state = aggregated
 ```
 
-`run.sh` 会在后台起 tensorboard(默认 6006),脚本退出时 `trap` 杀掉它。
+第二轮的起点是第一轮服务端聚合所得 `global_state`，它会先写入所有客户端 adapter；之后各客户端在同一聚合起点上分别训练。客户端在一轮内按编号顺序执行，但彼此 adapter 独立，不应把前一个客户端的本地结果当成后一个客户端的起点。
 
-也可以不走脚本直接跑:
+当前训练还有以下重要语义：
 
-```bash
-python main.py --config configs/smoke.yaml
-```
+- 基座模型权重在客户端之间共享，LoRA adapter 相互独立。
+- 每个客户端每轮重新创建 AdamW，优化器动量等状态不跨 round 保留。
+- DataLoader seed 为 `seed + round_id * num_clients + client_id`，因此客户端和 round 的打乱顺序不同，但在同一配置下可复现。
+- `local_steps` 超过一个分片的 batch 数时，会重新创建该 DataLoader 的迭代器并继续取样。
+- 默认聚合计算每个客户端的 `B @ A`，做客户端等权平均，再用 SVD 分解回指定 rank 的 A/B。
+- 当前默认聚合不是按样本量或监督 token 数加权。比较非均衡分片实验时必须明确这一点。
+- checkpoint 只保存聚合后的 adapter 参数，不保存 optimizer、DataLoader iterator 或 RNG 状态，因此不支持从 checkpoint 精确恢复训练现场。
 
-`main.py` 的 CLI 只有 `--config`,configs 是唯一真相源,不支持命令行覆盖字段。
+## 加解密与聚合边界
 
-## 自定义加解密 / 聚合逻辑
-
-框架的业务钩子**全部在 `main.py` 顶部**,以函数指针形式作为入参传入 `Client` / `Server`。默认实现是恒等 + 乘积 FedAvg,保证明文链路可跑通。
-
-### 钩子的签名和位置
-
-打开 `main.py`,顶部这一段就是全部业务逻辑:
+业务钩子位于 `main.py` 顶部：
 
 ```python
 encrypt_fn = lambda state_dict, client_id, round_id: state_dict
-
 decrypt_fn = lambda ciphertext, client_id, round_id: ciphertext
-
 aggregate_fn = lambda plaintexts, rank: aggregate_lora_products(plaintexts, rank=rank)
-
 secure_aggregate_fn = None
 ```
 
-| 钩子 | 签名 | 语义 |
+接口含义：
+
+| 钩子 | 输入 | 输出 |
 |---|---|---|
-| `encrypt_fn` | `(Dict[str, Tensor], int, int) -> Any` | 客户端加密。后两个参数为 `client_id` / `round_id`。 |
-| `decrypt_fn` | `(Any, int, int) -> Dict[str, Tensor]` | 服务端解密。后两个参数为 `client_id` / `round_id`。 |
-| `aggregate_fn` | `(List[Dict[str, Tensor]], int) -> Dict[str, Tensor]` | 服务端明文聚合。默认对 `B @ A` 做等权平均,再分解回 LoRA A/B。 |
-| `secure_aggregate_fn` | `Optional[(List[Tuple[int, Any]], int) -> Dict[str, Tensor]]` | 联合密文聚合。设为 `None` 时走默认解密后聚合。 |
+| `encrypt_fn` | adapter state、client id、round id | 任意可传递的密文对象 |
+| `decrypt_fn` | 密文对象、client id、round id | 可聚合的 adapter state |
+| `aggregate_fn` | 全部客户端明文 state、目标 rank | 聚合后的 adapter state |
+| `secure_aggregate_fn` | `(client_id, ciphertext)` 列表、round id | 聚合后的 adapter state |
 
-流水线在 `main.py` 里显性写出来:
+`secure_aggregate_fn is None` 时，`Server` 逐客户端调用 `decrypt_fn`，再调用明文 `aggregate_fn`。设置密文聚合函数后，服务端不走逐客户端解密路径。
 
-```
-client 端:  state_dict + client_id + round_id  --encrypt_fn-->  ciphertext(Any)
-                                                               │  上传到 server
-server 端:  ciphertext + client_id + round_id  --decrypt_fn-->  plaintexts
-                                      --aggregate_fn--> downstream {A, B}
-                                                               │  下发回每个客户端 adapter
-```
+约束：
 
-默认聚合会对客户端 LoRA 乘积做等权平均,再分解成下发所需的 A/B。
+- 加密和解密的对象结构必须严格配对，框架不会推断密文格式。
+- 解密或密文聚合返回的 key、shape 和 dtype 必须能写回 PEFT adapter。
+- `client_id` 和 `round_id` 可用于密钥选择、AAD 或轮次隔离。
+- `sizeof` 使用 pickle 序列化后的字节数作为明文、密文和下发大小的统一度量口径。
+- 加密计时只覆盖 `client.encrypt(...)`；训练时间和服务端聚合时间分别统计。
+- 引入有损近似、量化或同态加密时，应单独验证解密误差、聚合误差和最终 checkpoint 可加载性。
 
-### 三种写法示例
+## 模型与数据集
 
-**用 lambda(短逻辑)**
+### 模型
 
-```python
-encrypt_fn = lambda sd, client_id, round_id: {k: v.numpy().tobytes() for k, v in sd.items()}
-decrypt_fn = lambda ct, client_id, round_id: {
-    k: torch.frombuffer(v, dtype=torch.float32).view(shape[k]) for k, v in ct.items()
-}
-```
+`models/__init__.py` 当前支持：
 
-**用 def(长逻辑,推荐)**
+- `dummy`：单层 Linear，仅用于冒烟测试。
+- `open_llama`：通过 `AutoModelForCausalLM.from_pretrained(..., local_files_only=True)` 从本地目录加载。
 
-```python
-def encrypt_fn(state_dict, client_id, round_id):
-    # 例: AES-GCM 对每个张量的 raw bytes 加密
-    import io, os
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    key = os.environ["FED_KEY"].encode()  # 32 bytes
-    aead = AESGCM(key)
-    out = {}
-    for k, v in state_dict.items():
-        nonce = os.urandom(12)
-        buf = io.BytesIO()
-        torch.save(v, buf)
-        out[k] = {"nonce": nonce, "ct": aead.encrypt(nonce, buf.getvalue(), None)}
-    return out
+OpenLLaMA dtype 支持 `float32`、`float16` 和 `bfloat16`。模型加载不访问远端；缺失权重或 tokenizer 时应先运行 `download.sh`。
 
-def decrypt_fn(ciphertext, client_id, round_id):
-    import io
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    key = os.environ["FED_KEY"].encode()
-    aead = AESGCM(key)
-    return {
-        k: torch.load(io.BytesIO(aead.decrypt(v["nonce"], v["ct"], None)))
-        for k, v in ciphertext.items()
-    }
+### 数据集注册
+
+`datasets/__init__.py` 当前支持：
+
+| `dataset.kind` | 实现 | 监督目标 |
+|---|---|---|
+| `dummy` | `datasets/dummy.py` | MSE 冒烟任务 |
+| `dolly_15k` | `datasets/dolly.py` | 仅 response + EOS |
+| `mmlu_train` | `datasets/mmlu_train.py` | 仅正确选项标签 + EOS |
+| `natural_instructions` | `datasets/natural_instructions.py` | 仅 targets + EOS |
+
+三个 causal-LM 数据集都会把 prompt 和 padding 对应的 label 设为 `-100`，因此 prompt 文本不参与 loss。这里不存在把参考答案放进输入后再同时监督 prompt 的行为；答案只作为需要预测的 completion 追加到序列尾部。
+
+### Super-NaturalInstructions
+
+数据来源为 `Muennighoff/natural-instructions`。加载器读取：
+
+```text
+datasets/natural-instructions/train/*.jsonl
 ```
 
-**用配置切换多套加密**
+单条样本必须包含：
 
-```python
-if config.get("encryption", "none") == "aes":
-    from my_crypto import aes_encrypt, aes_decrypt
-    encrypt_fn, decrypt_fn = aes_encrypt, aes_decrypt
-elif config.get("encryption") == "he":
-    from my_crypto import he_encrypt, he_decrypt, he_aggregate
-    encrypt_fn, decrypt_fn, aggregate_fn = he_encrypt, he_decrypt, he_aggregate
+```json
+{"definition": "...", "inputs": "...", "targets": "..."}
 ```
 
-### 接口的自由度说明
+`inputs` 可以为空；`definition` 和 `targets` 必须是非空字符串。提示模板由 `definition + inputs` 构成，仅 `targets + EOS` 参与 loss。
 
-- `encrypt_fn` 返回类型是 `Any`,可以是 `bytes` / `dict` / 自定义对象,`decrypt_fn` 拿到什么由自己配对。
-- `client_id` / `round_id` 由框架传入,可直接用于身份相关密钥、标签或轮次隔离。
-- 客户端与服务端之间传递的 `ciphertext` 是原对象,不落盘、不序列化;`main.py` 在 `sizeof(ciphertext)` 时用 `pickle.dumps` 度量大小,这是**大小度量的唯一口径**(明文、密文、下发都用它,可直接比较膨胀比)。
-- **密文域聚合**:如果加密方案需要联合处理全部密文,实现 `secure_aggregate_fn(ciphertexts, round_id)` 并把它设为非 `None`。
-- `aggregate_fn` 拿到的每份 `state_dict` 的 key 与顺序都一致(peft 决定),可以直接按 key 一一对应。
+设置 `dataset.max_samples` 后，加载器先按 seed 打乱任务文件，再限制每个任务文件的最大样本数，避免截取结果集中于少数任务。加载阶段会一次性完成分词并把固定长度 tensor 保存在内存中；提高 `max_samples` 或 `max_length` 会直接增加主机内存占用。
 
-### 修改后如何验证
+当前所有真实训练集只实现 `iid_uniform` 分片。分片在训练开始时构建一次，各 round 复用同一分片，但 DataLoader 的 shuffle seed 随 round 变化。
 
-- **端到端能否跑通**:直接跑 `./run.sh` 冒烟。看 `logs/<RUN_ID>/train.log` 里的 `加密耗时` / `明文=xxB 密文=xxB` / `聚合完成` 三行是否符合预期,以及是否有 traceback。
-- **加密确实生效了**:看 `output/<RUN_ID>/metrics/round.csv` 的 `ciphertext_size` 列,如果和 `plaintext_size` 完全相等且你不是恒等占位,说明加密没接上。
-- **数值正确性**:看 `step.csv` 的 loss 曲线是否随 round 平稳下降。真加密下如果 loss 抖动明显,通常是加密引入了不可逆的精度损失或聚合逻辑对齐问题。
+## 下载入口
 
-## runtime/ 里放了什么
+```bash
+bash download.sh [TARGET ...]
+```
 
-`main.py` 保持极致精简,只保留「读 config → 建目录 / logger → 建模型 / 数据 → 循环骨架」。真正的实现细节全部拆到 `runtime/` 下:
+| TARGET | 资源 | 输出位置 |
+|---|---|---|
+| `llama3bv2` | OpenLLaMA 3B v2 | `models/open_llama_3b_v2/` |
+| `llama7bv2` | OpenLLaMA 7B v2 | `models/open_llama_7b_v2/` |
+| `dolly` | Dolly 15k | `datasets/databricks-dolly-15k/` |
+| `natural-instructions` | Super-NaturalInstructions train | `datasets/natural-instructions/train/` |
+| `mmlu-train` | MMLU auxiliary train | `datasets/mmlu/mmlu_auxiliary_train.jsonl` |
+| `gsm8k-train` | GSM8K main train | `datasets/gsm8k/train.jsonl` |
+| `mmlu` | MMLU test | `evaluation/mmlu/mmlu_test.jsonl` |
+| `gsm8k` | GSM8K main test | `evaluation/gsm8k/test.jsonl` |
+| `all` | 以上全部资源 | 对应目录 |
 
-| 文件 | 职责 |
+无参数等价于 `all`。MMLU/GSM8K 下载包含 Parquet 转换，依赖当前 Python 环境中的 `pyarrow`。下载器支持重新执行和断点续传，不应通过删除已有目录来处理普通的重复下载。
+
+## 训练指标定义
+
+训练终端日志、CSV 和 TensorBoard 由 `training_progress.py` 与 `utils/metrics.py` 写入。
+
+### `step.csv`
+
+每个客户端每个本地 step 一行：
+
+| 字段 | 定义 |
 |---|---|
-| `device.py` | 挑 device(mps/cuda/cpu)、设全局种子 |
-| `paths.py` | 计算 RUN_ID 与所有输出目录 |
-| `peft_ops.py` | 挂 peft LoRA、注册多 adapter、遍历 adapter 参数 |
-| `broadcast.py` | 把上一轮聚合结果灌回每个 adapter |
-| `train_step.py` | 一个客户端一整轮本地训练 + loss / grad_norm 记录 |
-| `loss.py` | 按 model kind 分派的 loss 计算与 batch 迁移 |
-| `checkpoint.py` | 存 round_XX 的 A/B/adapter_model safetensors + final 软链 |
+| `loss` | 当前 batch 的模型 loss；OpenLLaMA 为监督 token 上的 causal-LM cross entropy |
+| `loss_moving_avg` | 当前客户端本轮最近 N 步 loss 的算术平均，N 由 `train.loss_moving_average_window` 控制，默认 20 |
+| `perplexity` | OpenLLaMA 下为 `exp(min(loss, 20))`；dummy 为 NaN |
+| `supervised_tokens` | 当前 batch 中 label 不等于 `-100` 的 token 数 |
+| `loss_sum` | `loss * supervised_tokens`，用于构造 token 加权均值 |
+| `global_grad_norm` | optimizer step 前，当前 adapter 全部参数梯度 L2 范数的合成值 |
+| `learning_rate` | 当前 optimizer 参数组学习率 |
+| `step_time` | 含前向、反向、optimizer step 和 CUDA 同步的耗时 |
+| `supervised_tokens_per_second` | `supervised_tokens / step_time` |
 
-这些是 main 的物理拆分,不对外暴露语义。业务逻辑只集中在 main 顶部三个函数指针上。
+### `client_round.csv`
 
-## 配置字段说明(configs/*.yaml)
+每个客户端每轮一行：
 
-```yaml
-seed: 42                                 # 全局种子,派生 seed 用 seed + client_id
+- `mean_loss`：本轮 step loss 的算术平均。
+- `token_weighted_mean_loss`：`sum(loss_sum) / sum(supervised_tokens)`，跨不同监督长度的 batch 更可比。
+- `min_loss`、`max_loss`、`final_loss`：本轮离散 step 的极值与末步值。
+- `final_moving_avg_loss`：本轮结束时的移动平均，比较收敛趋势时通常比 `final_loss` 稳定。
+- `perplexity`：由 token 加权平均 loss 计算。
+- `supervised_tokens`：本轮实际参与 loss 的 token 总数。
+- `mean_step_time`、`train_time`：平均 step 耗时和本地训练总耗时。
 
-federated:
-  num_clients: 4                         # 客户端数
-  num_rounds: 10                         # 总轮数
-  local_steps: 50                        # 每客户端每轮本地 step 数
+### 其他 CSV
 
-lora:
-  rank: 4                                # LoRA rank
-  alpha: 8
-  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+- `round.csv`：每轮每客户端的 `encrypt_time`、`plaintext_size`、`ciphertext_size`，以及本轮共享的 `aggregate_time`、`broadcast_size`。
+- `grad_norm.csv`：每层 LoRA 参数的逐 step 梯度范数长表。
 
-train:
-  batch_size: 4
-  learning_rate: 2.0e-4
-  optimizer: adamw
-  weight_decay: 0.0
-  dtype: float32                         # 训练精度,保持与 C++ 模块兼容
+学术对比收敛速度时，应优先使用相同 token 预算下的 `token_weighted_mean_loss` 或 `final_moving_avg_loss`，同时报告数据集、有效监督 token、客户端数、round、local steps、batch size、学习率和 seed。不同任务的绝对 loss 不可直接比较。
 
-model:
-  kind: dummy | open_llama               # 分派到 models/__init__.py
+## 输出与 checkpoint
 
-dataset:
-  kind: dummy | dolly_15k                # 分派到 datasets/__init__.py
-  path: ./datasets/databricks-dolly-15k/databricks-dolly-15k.jsonl
-  max_length: 512                        # Dolly causal-LM 序列长度
-  split_method: iid_uniform              # 目前只实现了 iid 均分
+`runtime/paths.py` 使用启动时间生成 `YYYY-MM-DD_HH-MM-SS` 格式的 `run_id`：
 
-logging:
-  level: INFO                            # DEBUG 只落文件,INFO+ 同时落控制台
-
-tensorboard:
-  port: 6006
+```text
+logs/<run_id>/train.log
+output/<run_id>/metrics/
+output/<run_id>/tensorboard/
+output/<run_id>/checkpoints/round_XX/
 ```
 
-## 观测产物
+每轮 checkpoint 包含：
 
-**CSV**(下游用 pandas 直接读):
+- `A.safetensors`：所有 LoRA A 参数；
+- `B.safetensors`：所有 LoRA B 参数；
+- `adapter_model.safetensors`：聚合后的完整 adapter state；
+- `final`：指向最后一轮目录的 POSIX 软链接。
 
-- `metrics/step.csv`: `round, client_id, step, loss` — 每 step 一行。
-- `metrics/round.csv`: `round, client_id, encrypt_time, plaintext_size, ciphertext_size, aggregate_time, broadcast_size` — 每 round × client 一行,服务端级字段(`aggregate_time` / `broadcast_size`)在同一轮的 N 行里冗余写 N 次,方便 join。
-- `metrics/grad_norm.csv`: `round, client_id, step, layer_name, grad_norm` — 长表。避免宽表列数爆炸。
+评估加载 `final/adapter_model.safetensors`。复制运行产物到不保留软链接的文件系统时，应确认 `final` 仍可解析，或直接指定/恢复最后一轮目录结构。
 
-**TensorBoard**(实时可看,`tensorboard --logdir output/<RUN>/tensorboard`):
+## 评估语义
 
-- `server/`:全局聚合耗时、下发大小
-- `client_0/` ... `client_{N-1}/`:每客户端的 loss、每层 grad_norm、加密耗时、明文/密文大小
+```bash
+bash evaluate.sh configs/<task>.yaml <run_id> <train|mmlu|gsm8k> [adapter|base]
+```
 
-**文本日志**:`logs/<RUN>/train.log`,人读用。
+默认 `adapter` 模式使用 `final/adapter_model.safetensors`，必须保证模型和 LoRA 配置与 checkpoint 匹配。`base` 模式直接评测配置中的底座模型，不创建 PEFT adapter，也不读取 checkpoint；此时 `run_id` 只负责把基线结果归入待对比实验的 `metrics/` 目录。
 
-**checkpoint**:`output/<RUN>/checkpoints/round_XX/{A,B,adapter_model}.safetensors`,`final` 软链指向最后一轮。
+adapter 结果沿用 `eval.csv`、`mmlu.csv`、`gsm8k.csv`，base 结果写入对应的 `*_base.csv`，避免彼此覆盖。所有评测 CSV 都包含 `model_mode` 字段。
 
-## 未完成 / 挂起
+### `train`
 
-1. **本地模型权重**:训练机器需单独准备 `openlm-research/open_llama_3b_v2`，正式实验可切换到 `open_llama_7b_v2`。
-2. **真数据集文件**:训练机器需单独准备 `datasets/databricks-dolly-15k/databricks-dolly-15k.jsonl`；代码已实现本地加载、指令模板编码、labels 构造和 `iid_uniform` 分片。
-3. **`run.sh` 追加 evaluate**:如需一键训练后评估,在 `run.sh` 末尾加 `python evaluate.py --config ... --run-id ...`。
+重新构建训练配置中的客户端分片，在每个分片上计算平均 batch loss 和 perplexity，写入 `metrics/eval.csv`。这是训练分布上的拟合指标，不是独立泛化测试，也不能替代 MMLU/GSM8K。
 
-## 编码铁律(项目自身遵循的)
+### `mmlu`
 
-- **明确边界**:client / server 只暴露入参出参;所有编排、计时、日志都在 main.py。
-- **最简化**:不做过度防御性编程。
-- **多路线先问**:遇到多种实现选择,先与用户确认再动。
-- **禁止幻觉**:不熟悉的 API 先读文档 / 试跑,不猜测。
+使用零样本四选一提示。分别计算 `A/B/C/D` completion 的 log probability，选择分数最高者。输出 `metrics/mmlu.csv`，其中包含：
+
+- `row_type=overall`：总正确数、总题数和准确率；
+- `row_type=subject`：分学科正确率；
+- `row_type=question`：逐题预测和正确性。
+
+### `gsm8k`
+
+使用确定性贪心生成，要求模型把最终数值放在 `####` 后。评分会规范化逗号、小数和负零，并对最终数值做 exact match。结果写入 `metrics/gsm8k.csv`。
+
+MMLU 和 GSM8K 的路径、输入长度、生成长度位于 `configs/evaluation.yaml`。评测过程均显示进度和当前累计准确率。
+
+## 修改与验证要求
+
+修改代码前先确认实际调用路径，尤其避免混淆 `training_progress.py` 与未被 `main.py` 调用的 `runtime/train_step.py`。
+
+数据集扩展至少需要：
+
+1. 在 `datasets/` 新增加载和编码实现。
+2. 在 `datasets/__init__.py` 注册新的 `dataset.kind`。
+3. 明确 prompt 与监督 labels 的边界。
+4. 添加字段校验、截断、mask、分片和确定性测试。
+5. 更新 `download.sh`、基准派生配置和文档。
+
+评测扩展至少需要：
+
+1. 在 `evaluation/` 实现 `BenchmarkResult`。
+2. 在 `evaluation/__init__.py` 注册 target。
+3. 在 `evaluate.py` 和 `evaluate.sh` 增加可选值。
+4. 在 `configs/evaluation.yaml` 增加路径和参数。
+5. 添加数据格式、评分和汇总行测试。
+
+提交前执行：
+
+```bash
+conda run -n skeleton_lora_fe python -m unittest discover -s tests -v
+conda run -n skeleton_lora_fe ruff check .
+bash -n download.sh run.sh evaluate.sh
+git diff --check
+```
+
+对于真实模型训练，还需至少完成一次对应任务配置的小规模运行，并确认：
+
+- 训练日志包含有限 loss 和非零监督 token；
+- `step.csv`、`client_round.csv`、`round.csv` 和 `grad_norm.csv` 正常写入；
+- checkpoint 能由 `evaluate.py` 加载；
+- 加密模式下密文大小、耗时和解密后数值符合预期。
+
+## 当前限制
+
+- 真实数据集只实现 IID 均分，没有 Dirichlet 或按任务/学科的 non-IID 分片。
+- 客户端顺序执行，不是并行训练。
+- 默认聚合为客户端等权，不按数据量加权。
+- optimizer 状态不跨 round 保存。
+- checkpoint 不包含完整恢复训练所需的状态。
+- `train` 评估复用训练分布；专业泛化结果应使用独立测试集。
+- MMLU 当前为 zero-shot，GSM8K 当前为 greedy generation，不包含 few-shot 或多次采样设置。
+
+## 协作约束
+
+- 不猜测第三方数据字段、模型 API、加密格式或服务器目录；先读本地代码、样本或官方资料。
+- 不改动与当前任务无关的文件，不覆盖用户未提交的修改。
+- 配置是实验记录的一部分；新增任务应派生配置，不应反复改写两个基准配置来代表多个实验。
+- 对训练语义有多种合理方案且会影响学术对比时，先说明差异再选择。
+- 任何声称“训练改善”或“评测提升”的结论都必须对应可复现配置、run id 和输出指标。

@@ -131,9 +131,9 @@ def _encode_record(
     if eos_token_id is not None and (not response_ids or response_ids[-1] != eos_token_id):
         response_ids.append(eos_token_id)
 
-    # 最长 prompt 也至少为 response 留一个监督 token，避免全 -100 labels 产生 NaN。
-    prompt_ids = prompt_ids[: max_length - 1]
-    response_ids = response_ids[: max_length - len(prompt_ids)]
+    response_budget = min(len(response_ids), max(1, min(max_length - 1, max_length // 2)))
+    response_ids = _truncate_response(response_ids, response_budget, eos_token_id)
+    prompt_ids = _truncate_prompt(prompt_ids, max_length - len(response_ids))
     input_ids = prompt_ids + response_ids
     supervised_length = len(response_ids)
     if supervised_length == 0:
@@ -148,6 +148,30 @@ def _encode_record(
         "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
         "labels": torch.tensor(labels, dtype=torch.long),
     }
+
+
+def _truncate_prompt(token_ids: list[int], budget: int) -> list[int]:
+    if len(token_ids) <= budget:
+        return token_ids
+    if budget <= 0:
+        return []
+    if budget == 1:
+        return token_ids[-1:]
+    return token_ids[:1] + token_ids[-(budget - 1):]
+
+
+def _truncate_response(
+    token_ids: list[int],
+    budget: int,
+    eos_token_id: int | None,
+) -> list[int]:
+    if len(token_ids) <= budget:
+        return token_ids
+    if budget <= 0:
+        return []
+    if eos_token_id is not None and budget >= 2 and token_ids[-1] == eos_token_id:
+        return token_ids[: budget - 1] + [eos_token_id]
+    return token_ids[:budget]
 
 
 def _format_prompt(instruction: str, context: str) -> str:

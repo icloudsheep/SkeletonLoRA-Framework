@@ -4,6 +4,7 @@ import unittest
 
 import torch
 
+from datasets import build_dataloader
 from datasets.dolly import (
     TokenizedCausalLMDataset,
     _encode_record,
@@ -49,6 +50,24 @@ class DollyTest(unittest.TestCase):
         self.assertTrue(torch.any(sample["labels"] != -100))
         self.assertTrue(torch.all(sample["labels"][sample["attention_mask"] == 0] == -100))
 
+    def test_long_prompt_and_response_keep_meaningful_supervision(self) -> None:
+        sample = _encode_record(
+            {
+                "instruction": "I" * 200,
+                "context": "C" * 200,
+                "response": "R" * 100,
+            },
+            tokenizer=_FakeTokenizer(),
+            pad_token_id=0,
+            max_length=32,
+            line_number=1,
+        )
+
+        supervised = sample["labels"][sample["labels"] != -100]
+        self.assertEqual(len(supervised), 16)
+        self.assertEqual(supervised[-1].item(), _FakeTokenizer.eos_token_id)
+        self.assertEqual(sample["input_ids"][0].item(), 1)
+
     def test_iid_split_is_complete_balanced_and_repeatable(self) -> None:
         values = torch.arange(30).reshape(10, 3)
         dataset = TokenizedCausalLMDataset(values, values, values)
@@ -65,6 +84,35 @@ class DollyTest(unittest.TestCase):
             sorted(index for shard in first for index in shard.indices),
             list(range(10)),
         )
+
+    def test_dataloader_shuffle_changes_between_rounds_and_is_repeatable(self) -> None:
+        config = {
+            "seed": 42,
+            "federated": {"num_clients": 2},
+            "train": {"batch_size": 1},
+        }
+        dataset = torch.arange(20)
+
+        first = _loader_order(build_dataloader(config, dataset, round_id=1, client_id=0))
+        repeated = _loader_order(build_dataloader(config, dataset, round_id=1, client_id=0))
+        next_round = _loader_order(build_dataloader(config, dataset, round_id=2, client_id=0))
+
+        self.assertEqual(first, repeated)
+        self.assertNotEqual(first, next_round)
+
+    def test_dataloader_rejects_out_of_range_client_id(self) -> None:
+        config = {
+            "seed": 42,
+            "federated": {"num_clients": 2},
+            "train": {"batch_size": 1},
+        }
+
+        with self.assertRaisesRegex(ValueError, "client_id 必须小于"):
+            build_dataloader(config, torch.arange(2), client_id=2)
+
+
+def _loader_order(dataloader) -> list[int]:
+    return [int(batch.item()) for batch in dataloader]
 
 
 if __name__ == "__main__":

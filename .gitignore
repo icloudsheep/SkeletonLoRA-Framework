@@ -18,6 +18,11 @@ hf-cache/
 # Local model weights and datasets (download separately; never commit large files)
 models/open_llama_*/
 datasets/databricks-dolly-15k/
+datasets/gsm8k/
+datasets/mmlu/
+datasets/natural-instructions/
+evaluation/gsm8k/
+evaluation/mmlu/
 
 # OS
 .DS_Store
