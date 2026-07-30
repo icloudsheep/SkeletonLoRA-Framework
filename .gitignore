@@ -12,7 +12,10 @@ pyrightconfig.json
 
 # Runtime artifacts
 logs/
-output/
+#output/
+*.safetensors
+grad_norm.csv
+events.out.*
 hf-cache/
 
 # Local model weights and datasets (download separately; never commit large files)
