@@ -167,9 +167,9 @@ datasets/natural-instructions/train/*.jsonl
 {"definition": "...", "inputs": "...", "targets": "..."}
 ```
 
-`inputs` 可以为空；`definition` 和 `targets` 必须是非空字符串。提示模板由 `definition + inputs` 构成，仅 `targets + EOS` 参与 loss。
+`inputs` 可以为空；`definition` 必须是非空字符串。空字符串 `targets` 会被跳过，且不占用 `dataset.max_samples` 配额；`targets` 缺失或类型错误仍会报错。提示模板由 `definition + inputs` 构成，仅 `targets + EOS` 参与 loss。
 
-设置 `dataset.max_samples` 后，加载器先按 seed 打乱任务文件，再限制每个任务文件的最大样本数，避免截取结果集中于少数任务。加载阶段会一次性完成分词并把固定长度 tensor 保存在内存中；提高 `max_samples` 或 `max_length` 会直接增加主机内存占用。
+设置 `dataset.max_samples` 后，加载器先按 seed 打乱任务文件，再限制每个任务文件的有效样本数，避免截取结果集中于少数任务。加载阶段会一次性完成分词并把固定长度 tensor 保存在内存中；提高 `max_samples` 或 `max_length` 会直接增加主机内存占用。
 
 当前所有真实训练集只实现 `iid_uniform` 分片。分片在训练开始时构建一次，各 round 复用同一分片，但 DataLoader 的 shuffle seed 随 round 变化。
 

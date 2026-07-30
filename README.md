@@ -103,7 +103,7 @@ bash download.sh natural-instructions
 bash run.sh configs/loss.yaml
 ```
 
-加载器只读取 `train/*.jsonl`，使用 `definition + inputs` 构造提示词，仅让 `targets + EOS` 参与 causal-LM loss。`dataset.max_samples` 可限制样本数，并在任务文件之间做确定性均衡抽样。
+加载器只读取 `train/*.jsonl`，使用 `definition + inputs` 构造提示词，仅让 `targets + EOS` 参与 causal-LM loss。空 `targets` 样本会被跳过且不占用 `dataset.max_samples` 配额；其他字段结构错误仍会终止加载。`dataset.max_samples` 可限制有效样本数，并在任务文件之间做确定性均衡抽样。
 
 ## 训练产物
 
