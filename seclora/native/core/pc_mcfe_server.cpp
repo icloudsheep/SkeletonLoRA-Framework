@@ -1,198 +1,249 @@
 #include "pc_mcfe_server.h"
+
 #include <algorithm>
-#include <string>
-#include <cmath>
 #include <chrono>
+#include <cmath>
+#include <stdexcept>
+#include <thread>
 
 using namespace mcl::bn;
 
-static inline double now_sec() {
+namespace {
+
+double now_sec() {
     return std::chrono::duration<double>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-PC_MCFE_Server::PC_MCFE_Server(int K, const SecLoRA_PP& global_pp)
-    : K_clients(K), pp(global_pp) {}
+}  // namespace
 
-// Decentralized key aggregation: d = sum p_i s_i, r_d = sum p_i r_{s,i}.
-std::pair<std::vector<Fr>, Fr> PC_MCFE_Server::AggregateKeys(
-    const std::vector<std::pair<std::vector<Fr>, Fr>>& client_shares) {
-    std::vector<Fr> d(2, Fr(0));
-    Fr r_d = 0;
-    for (int i = 0; i < K_clients; ++i) {
-        d[0] += client_shares[i].first[0];
-        d[1] += client_shares[i].first[1];
-        r_d += client_shares[i].second;
+PC_MCFE_Server::PC_MCFE_Server(
+    int K, const SecLoRA_PP& global_pp,
+    const DmcfePublicParams2& global_dfe_pp)
+    : K_clients(K), pp(global_pp), dfe_pp(global_dfe_pp) {}
+
+DmcfeFunctionalKey2 PC_MCFE_Server::DKeyComb(
+    const std::vector<DmcfeKeyShare2>& client_shares) const {
+    if (static_cast<int>(client_shares.size()) != K_clients) {
+        throw std::invalid_argument("incomplete DMCFE key-share family");
     }
-    return std::make_pair(d, r_d);
+    return ABG19DmcfeMask2::DKeyComb(client_shares);
 }
 
-// VerifyKey: prod C_{s,i}^{p_i} == g0^{d0} g1^{d1} h^{r_d}.
-bool PC_MCFE_Server::VerifyKey(const std::vector<Fr>& p_weights,
-                               const std::vector<Fr>& dk_d, const Fr& r_d) {
-    G1 left; left.clear();
-    for (int i = 0; i < K_clients; ++i) {
-        G1 term; G1::mul(term, pp.cmt_s[i], p_weights[i]);
-        G1::add(left, left, term);
+double PC_MCFE_Server::PrepareDfeMaskCacheRefs(
+    const std::vector<const std::vector<A_Ciphertext_Slot>*>& all_A_cts,
+    const std::vector<Fr>& p_weights,
+    const DmcfeFunctionalKey2& key,
+    const std::vector<int>& columns,
+    int threads,
+    double& worker_thread_sum_sec) {
+    if (static_cast<int>(all_A_cts.size()) != K_clients ||
+        static_cast<int>(p_weights.size()) != K_clients) {
+        throw std::invalid_argument("incomplete PC-DMCFE client family");
     }
-    G1 right, g0p, g1p, hp, tmp;
-    G1::mul(g0p, pp.g0, dk_d[0]); G1::mul(g1p, pp.g1, dk_d[1]); G1::mul(hp, pp.h_blinding, r_d);
-    G1::add(tmp, g0p, g1p); G1::add(right, tmp, hp);
-    return (left == right);
+
+    size_t matrix_cols = 0;
+    for (const auto* client_cts : all_A_cts) {
+        if (client_cts == nullptr) {
+            throw std::invalid_argument("null A ciphertext family");
+        }
+        matrix_cols = std::max(matrix_cols, client_cts->size());
+    }
+    for (int column : columns) {
+        if (column < 0 || static_cast<size_t>(column) >= matrix_cols) {
+            throw std::invalid_argument("DMCFE A-label column is out of range");
+        }
+        for (const auto* client_cts : all_A_cts) {
+            if (static_cast<size_t>(column) >= client_cts->size()) {
+                throw std::invalid_argument(
+                    "missing DMCFE A-label ciphertext");
+            }
+        }
+    }
+
+    dfe_mask_cache_.assign(matrix_cols, std::array<G1, 2>());
+    dfe_mask_ready_.assign(matrix_cols, 0);
+    const int worker_count = columns.empty()
+        ? 0
+        : std::min(
+              std::max(1, threads), static_cast<int>(columns.size()));
+    std::vector<double> worker_seconds(
+        static_cast<size_t>(worker_count), 0.0);
+
+    const double wall_start = now_sec();
+    auto worker = [&](int thread_id) {
+        for (size_t index = static_cast<size_t>(thread_id);
+             index < columns.size();
+             index += static_cast<size_t>(worker_count)) {
+            const double started = now_sec();
+            const int column = columns[index];
+            std::vector<DmcfeCiphertext2> ciphertexts(
+                static_cast<size_t>(K_clients));
+            for (int client = 0; client < K_clients; ++client) {
+                ciphertexts[static_cast<size_t>(client)] =
+                    (*all_A_cts[static_cast<size_t>(client)])
+                    [static_cast<size_t>(column)].dfe_ct;
+            }
+            dfe_mask_cache_[static_cast<size_t>(column)] =
+                ABG19DmcfeMask2::Dec(
+                    dfe_pp, key, p_weights, ciphertexts);
+            dfe_mask_ready_[static_cast<size_t>(column)] = 1;
+            worker_seconds[static_cast<size_t>(thread_id)] +=
+                now_sec() - started;
+        }
+    };
+
+    std::vector<std::thread> pool;
+    for (int thread_id = 0; thread_id < worker_count; ++thread_id) {
+        pool.emplace_back(worker, thread_id);
+    }
+    for (std::thread& thread : pool) thread.join();
+
+    worker_thread_sum_sec = 0.0;
+    for (double seconds : worker_seconds) {
+        worker_thread_sum_sec += seconds;
+    }
+    return now_sec() - wall_start;
 }
 
-// Build the baby-step table for a fixed base. baby[base^j] = j for j in [0, m),
-// m = ceil(sqrt(bound)); giant_inv = base^{-m}. Depends only on base, so it is
-// built once and reused for every protected skeleton cell.
 void PC_MCFE_Server::build_bsgs(
-    const GT& base,
-    long long bound,
+    const GT& base, long long bound,
     const std::function<void(long long, long long)>& progress) {
+    if (bound <= 0) {
+        throw std::invalid_argument("BSGS bound must be positive");
+    }
     base_gt_ = base;
     bsgs_.bound = bound;
-    bsgs_.m = (long long)std::ceil(std::sqrt((double)bound));
+    bsgs_.m = static_cast<long long>(
+        std::ceil(std::sqrt(static_cast<double>(bound))));
     bsgs_.baby.clear();
-    bsgs_.baby.reserve((size_t)bsgs_.m * 2);
+    bsgs_.baby.reserve(static_cast<size_t>(bsgs_.m) * 2);
 
-    GT cur; GT::pow(cur, base, Fr(0));            // base^0 = identity
+    GT current;
+    GT::pow(current, base, Fr(0));
     const long long progress_step = std::max(1LL, bsgs_.m / 20);
     for (long long j = 0; j < bsgs_.m; ++j) {
-        bsgs_.baby.emplace(cur.getStr(mcl::IoSerialize), j);
-        cur *= base;                             // cur = base^{j+1}
-        if (progress && ((j + 1) % progress_step == 0 || j + 1 == bsgs_.m)) {
+        bsgs_.baby.emplace(current.getStr(mcl::IoSerialize), j);
+        current *= base;
+        if (progress &&
+            ((j + 1) % progress_step == 0 || j + 1 == bsgs_.m)) {
             progress(j + 1, bsgs_.m);
         }
     }
-    GT::inv(bsgs_.giant_inv, cur);               // cur == base^m -> base^{-m}
+    GT::inv(bsgs_.giant_inv, current);
     bsgs_.built = true;
 }
 
 long long PC_MCFE_Server::bsgs_table_bytes_estimate() const {
-    long long key_bytes = base_gt_.getStr(mcl::IoSerialize).size();
-    return (long long)bsgs_.baby.size() * (key_bytes + (long long)sizeof(long long));
+    const long long key_bytes =
+        static_cast<long long>(base_gt_.getStr(mcl::IoSerialize).size());
+    return static_cast<long long>(bsgs_.baby.size()) *
+           (key_bytes + static_cast<long long>(sizeof(long long)));
 }
 
-// Bidirectional BSGS over GT. Solve base^e == target for e in [-bound, bound].
-// Positive branch: target * base^{-i m} == base^j  -> e =  (i m + j).
-// Negative branch: same against target^{-1}         -> e = -(i m + j).
-// Both branches are interleaved so small |e| are found at i = 0.
-long long PC_MCFE_Server::bsgs_search(const GT& target, bool& found) const {
+long long PC_MCFE_Server::bsgs_search(
+    const GT& target, bool& found) const {
+    if (!bsgs_.built) {
+        throw std::logic_error("BSGS table has not been built");
+    }
     found = false;
-    GT gpos = target;
-    GT gneg; GT::inv(gneg, target);
+    GT positive = target;
+    GT negative;
+    GT::inv(negative, target);
     for (long long i = 0; i <= bsgs_.m; ++i) {
-        auto itp = bsgs_.baby.find(gpos.getStr(mcl::IoSerialize));
-        if (itp != bsgs_.baby.end()) {
-            long long e = i * bsgs_.m + itp->second;
-            if (e <= bsgs_.bound) { found = true; return e; }
+        const auto positive_it =
+            bsgs_.baby.find(positive.getStr(mcl::IoSerialize));
+        if (positive_it != bsgs_.baby.end()) {
+            const long long exponent =
+                i * bsgs_.m + positive_it->second;
+            if (exponent <= bsgs_.bound) {
+                found = true;
+                return exponent;
+            }
         }
-        auto itn = bsgs_.baby.find(gneg.getStr(mcl::IoSerialize));
-        if (itn != bsgs_.baby.end()) {
-            long long e = i * bsgs_.m + itn->second;
-            if (e <= bsgs_.bound) { found = true; return -e; }
+        const auto negative_it =
+            bsgs_.baby.find(negative.getStr(mcl::IoSerialize));
+        if (negative_it != bsgs_.baby.end()) {
+            const long long exponent =
+                i * bsgs_.m + negative_it->second;
+            if (exponent <= bsgs_.bound) {
+                found = true;
+                return -exponent;
+            }
         }
-        gpos *= bsgs_.giant_inv;
-        gneg *= bsgs_.giant_inv;
+        positive *= bsgs_.giant_inv;
+        negative *= bsgs_.giant_inv;
     }
     return 0;
-}
-
-// Decrypt one protected aggregate cell DeltaW[u,v]. Assumes build_bsgs() already ran.
-int PC_MCFE_Server::decrypt_one_cell(
-    const std::vector<std::vector<A_Ciphertext_Slot>>& all_A_cts,
-    const std::vector<std::vector<B_SecretKey_Slot>>& all_B_sks,
-    const std::vector<Fr>& p_weights,
-    const std::pair<std::vector<Fr>, Fr>& dk_d,
-    int layer_id, int pos_y, int round_q, int u, int v, bool& found) {
-
-    GT v_group = eval_one_cell_group(all_A_cts, all_B_sks, p_weights, dk_d,
-                                     layer_id, pos_y, round_q, u, v);
-    return (int)bsgs_search(v_group, found);
-}
-
-GT PC_MCFE_Server::eval_one_cell_group(
-    const std::vector<std::vector<A_Ciphertext_Slot>>& all_A_cts,
-    const std::vector<std::vector<B_SecretKey_Slot>>& all_B_sks,
-    const std::vector<Fr>& p_weights,
-    const std::pair<std::vector<Fr>, Fr>& dk_d,
-    int layer_id, int pos_y, int round_q, int u, int v) {
-
-    std::vector<const std::vector<A_Ciphertext_Slot>*> a_refs;
-    std::vector<const std::vector<B_SecretKey_Slot>*> b_refs;
-    a_refs.reserve(all_A_cts.size());
-    b_refs.reserve(all_B_sks.size());
-    for (const auto& slots : all_A_cts) a_refs.push_back(&slots);
-    for (const auto& slots : all_B_sks) b_refs.push_back(&slots);
-    return eval_one_cell_group_refs(
-        a_refs, b_refs, p_weights, dk_d,
-        layer_id, pos_y, round_q, u, v);
 }
 
 GT PC_MCFE_Server::eval_one_cell_group_refs(
     const std::vector<const std::vector<A_Ciphertext_Slot>*>& all_A_cts,
     const std::vector<const std::vector<B_SecretKey_Slot>*>& all_B_sks,
     const std::vector<Fr>& p_weights,
-    const std::pair<std::vector<Fr>, Fr>& dk_d,
     int layer_id, int pos_y, int round_q, int u, int v) {
-
-    std::string lb = labelB(layer_id, pos_y, u, round_q);
-    G2 t_lb; hashAndMapToG2(t_lb, lb.c_str(), lb.length());
-
-    GT v_group; GT::pow(v_group, base_gt_, Fr(0));
-    G1 combined; combined.clear();
-
-    for (int i = 0; i < K_clients; ++i) {
-        const auto& ct_v = (*all_A_cts[i])[v];
-        const auto& sk_u = (*all_B_sks[i])[u];
-        Fr p_i = p_weights[i];
-
-        G1 wc; G1::mul(wc, ct_v.c_i, p_i); combined += wc;
-        if (ct_v.is_zero) continue;
-
-        GT local;
-        if (sk_u.is_zero) {
-            const auto& c2 = ct_v.ife_c2;
-            int sz = (int)c2.size();
-            GT p1, p2;
-            pairing(p1, c2[0], sk_u.ife_k1);
-            pairing(p2, c2[sz - 2], t_lb);
-            local = p1 * p2;
-        } else {
-            pairing(local, ct_v.ife_c1, sk_u.ife_k1);
-            for (size_t j = 0; j < ct_v.ife_c2.size(); ++j) {
-                GT bp; pairing(bp, ct_v.ife_c2[j], sk_u.ife_k2[j]); local *= bp;
-            }
-        }
-        GT w; GT::pow(w, local, p_i); v_group *= w;
+    if (static_cast<int>(all_A_cts.size()) != K_clients ||
+        static_cast<int>(all_B_sks.size()) != K_clients ||
+        static_cast<int>(p_weights.size()) != K_clients) {
+        throw std::invalid_argument("incomplete PC-DMCFE client family");
+    }
+    if (v < 0 || static_cast<size_t>(v) >= dfe_mask_ready_.size() ||
+        !dfe_mask_ready_[static_cast<size_t>(v)]) {
+        throw std::logic_error(
+            "DMCFE mask cache is not ready for A label");
     }
 
-    std::string a0 = labelA(layer_id, pos_y, v, round_q, 0);
-    std::string a1 = labelA(layer_id, pos_y, v, round_q, 1);
-    G1 ua0, ua1; hashAndMapToG1(ua0, a0.c_str(), a0.length()); hashAndMapToG1(ua1, a1.c_str(), a1.length());
-    G1 ud0, ud1, u_d;
-    G1::mul(ud0, ua0, dk_d.first[0]); G1::mul(ud1, ua1, dk_d.first[1]); G1::add(u_d, ud0, ud1);
-    G1 isolated; G1::sub(isolated, combined, u_d);
+    std::array<G2, 2> tag;
+    for (int channel = 0; channel < 2; ++channel) {
+        const std::string label =
+            labelBTag(layer_id, pos_y, u, round_q, channel);
+        hashAndMapToG2(
+            tag[static_cast<size_t>(channel)],
+            label.data(), label.size());
+    }
 
-    GT noise; pairing(noise, isolated, t_lb);
-    GT inv_noise; GT::pow(inv_noise, noise, Fr(-1));
-    v_group *= inv_noise;
+    GT result;
+    GT::pow(result, base_gt_, Fr(0));
+    for (int client = 0; client < K_clients; ++client) {
+        const auto* a_slots = all_A_cts[static_cast<size_t>(client)];
+        const auto* b_slots = all_B_sks[static_cast<size_t>(client)];
+        if (a_slots == nullptr || b_slots == nullptr ||
+            static_cast<size_t>(v) >= a_slots->size() ||
+            u < 0 || static_cast<size_t>(u) >= b_slots->size()) {
+            throw std::invalid_argument("missing FH-IPFE slot");
+        }
+        const auto& ciphertext = (*a_slots)[static_cast<size_t>(v)];
+        const auto& key = (*b_slots)[static_cast<size_t>(u)];
+        if (ciphertext.ife_c2.size() != key.ife_k2.size()) {
+            throw std::invalid_argument(
+                "FH-IPFE ciphertext/key dimension mismatch");
+        }
 
-    return v_group;
-}
+        GT local;
+        pairing(local, ciphertext.ife_c1, key.ife_k1);
+        for (size_t element = 0;
+             element < ciphertext.ife_c2.size(); ++element) {
+            GT pairing_value;
+            pairing(
+                pairing_value, ciphertext.ife_c2[element],
+                key.ife_k2[element]);
+            local *= pairing_value;
+        }
+        GT weighted;
+        GT::pow(
+            weighted, local, p_weights[static_cast<size_t>(client)]);
+        result *= weighted;
+    }
 
-int PC_MCFE_Server::decrypt_one_cell_timed(
-    const std::vector<std::vector<A_Ciphertext_Slot>>& all_A_cts,
-    const std::vector<std::vector<B_SecretKey_Slot>>& all_B_sks,
-    const std::vector<Fr>& p_weights,
-    const std::pair<std::vector<Fr>, Fr>& dk_d,
-    int layer_id, int pos_y, int round_q, int u, int v, bool& found,
-    double& bsgs_sec) {
-
-    GT v_group = eval_one_cell_group(all_A_cts, all_B_sks, p_weights, dk_d,
-                                     layer_id, pos_y, round_q, u, v);
-
-    double t0 = now_sec();
-    int ret = (int)bsgs_search(v_group, found);
-    bsgs_sec = now_sec() - t0;
-    return ret;
+    GT mask_0;
+    GT mask_1;
+    pairing(
+        mask_0, dfe_mask_cache_[static_cast<size_t>(v)][0], tag[0]);
+    pairing(
+        mask_1, dfe_mask_cache_[static_cast<size_t>(v)][1], tag[1]);
+    const GT mask = mask_0 * mask_1;
+    GT inverse_mask;
+    GT::pow(inverse_mask, mask, Fr(-1));
+    result *= inverse_mask;
+    return result;
 }

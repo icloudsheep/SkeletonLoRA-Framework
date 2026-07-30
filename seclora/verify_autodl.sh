@@ -10,6 +10,8 @@ fi
 
 cd "${ROOT_DIR}"
 
+"${ROOT_DIR}/seclora/native/build/seclora_session_selftest"
+
 "${PYTHON_BIN}" -m unittest \
     tests.test_seclora \
     tests.test_seclora_native

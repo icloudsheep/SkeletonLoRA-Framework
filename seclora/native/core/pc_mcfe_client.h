@@ -1,6 +1,7 @@
 #ifndef PC_MCFE_CLIENT_H
 #define PC_MCFE_CLIENT_H
 
+#include <array>
 #include <vector>
 #include <string>
 #include <utility>
@@ -10,31 +11,24 @@
 
 // Data-independent precompute for one encA call (per column).
 struct EncA_Precomp {
-    std::vector<iFE_FH_Core::EncPrecomp> ife;  // iFE ciphertext base (r1, x baked in)
-    std::vector<mcl::bn::G1> c_i;              // u_s_term + g0^x  (non-zero column mask)
-    std::vector<mcl::bn::G1> u_s_only;         // u_s_term         (zero column mask)
-    std::vector<mcl::bn::Fr> x;                // per-column offline randomness
+    std::vector<iFE_FH_Core::EncPrecomp> ife;
+    std::vector<DmcfeCiphertext2> dfe;
+    std::vector<std::array<mcl::bn::Fr, 2>> x;
 };
 
 // Data-independent precompute for one encB call (per row).
 struct EncB_Precomp {
-    std::vector<iFE_FH_Core::KeyPrecomp> key;  // iFE key base (r2, t_lb baked in)
-    std::vector<mcl::bn::G2> k_hat;            // compact dual-mode key for a zero row
+    std::vector<iFE_FH_Core::KeyPrecomp> key;
 };
 
-// PC-MCFE client: holds a long-term key s_i, encrypts the A matrix (encA),
-// generates B-row keys (encB), and contributes its KeyGen share.
+// PC-DMCFE client: FH-IPFE is round-specific; DMCFE state is long-lived.
 class PC_MCFE_Client {
 private:
     int client_id;
     int m_rank;
     const SecLoRA_PP& pp;
-
-    std::vector<mcl::bn::Fr> s_i;   // long-term key s_i in Z_p^2
-    mcl::bn::Fr r_si;               // blinding for C_{s,i}
-    mcl::bn::G1 C_si;               // C_{s,i} = g0*s0 + g1*s1 + h*r_si
-
-    std::vector<mcl::bn::Fr> last_x_randomness;   // per-column A-side randomness x_v
+    const DmcfePublicParams2& dfe_pp;
+    DmcfeClientSecret2 dfe_secret;
 
     std::vector<std::vector<mcl::bn::Fr>> local_A;  // R x cols
     std::vector<std::vector<mcl::bn::Fr>> local_B;  // rows x R
@@ -45,10 +39,12 @@ private:
     EncB_Precomp encB_pre;   // filled by precompute_encB, consumed by encB
 
 public:
-    PC_MCFE_Client(int id, int rank, const SecLoRA_PP& global_pp);
-    mcl::bn::G1 GetCommitment() const { return C_si; }
+    PC_MCFE_Client(int id, int rank, const SecLoRA_PP& global_pp,
+                   const DmcfePublicParams2& global_dfe_pp,
+                   const DmcfeClientSecret2& client_dfe_secret);
 
-    std::pair<std::vector<mcl::bn::Fr>, mcl::bn::Fr> KeyGenShare(const std::vector<mcl::bn::Fr>& p_weights);
+    DmcfeKeyShare2 KeyGenShare(
+        const std::vector<mcl::bn::Fr>& p_weights) const;
 
     void u_setup() { ife.u_setup(); }
 

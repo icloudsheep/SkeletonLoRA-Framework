@@ -61,7 +61,7 @@ py::array_t<long long> matrix_array(
 }  // namespace
 
 PYBIND11_MODULE(_seclora_native, module) {
-    module.doc() = "Persistent PC-MCFE SEL-2S backend for SkeletonLoRA";
+    module.doc() = "Persistent PC-DMCFE SEL-2S backend for SkeletonLoRA";
 
     py::class_<NativeClientUpdate, std::shared_ptr<NativeClientUpdate>>(
         module, "NativeClientUpdate")

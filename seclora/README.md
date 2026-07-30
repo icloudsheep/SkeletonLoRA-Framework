@@ -21,15 +21,18 @@ the reusable BSGS table must not be rebuilt for every layer. Layers are streamed
 through the native session so encryption precomputation can be released after
 each layer.
 
-The existing compact representation for quantized all-zero A columns and B rows
-is intentionally preserved.
+The native core uses the paper-aligned two-coordinate mask construction: two
+independent ABG19/ALS16 DMCFE instances recover the weighted A-side masks, and
+the FH-IPFE vector has dimension `2R+3`. Quantized all-zero A columns and B rows
+use the same standard ciphertext/key shape as nonzero vectors; no zero-structure
+flag or compact zero encoding is transmitted.
 
 ## SEL-2S Data Flow
 
 - Quantization is `round(2^sfp * clip(x, -xmax, xmax))`.
 - The public BSGS bound is `M = ceil(2^sfp * xmax)^2 * K * R`.
 - `S_P` receives only clear B rows and clear A columns as signed int64 factors.
-- `S_D` receives only PC-MCFE objects for the protected prefix and the public
+- `S_D` receives only PC-DMCFE objects for the protected prefix and the public
   pivot candidate pool.
 - The candidate pool contains at most `2*K*R` deterministic, spread-out rows
   and columns from the clear region. Complete pivoting over this public block

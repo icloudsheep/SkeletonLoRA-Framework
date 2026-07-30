@@ -87,10 +87,11 @@ private:
     bool closed_ = false;
 
     SecLoRA_PP pp_;
+    DmcfePublicParams2 dfe_pp_;
     std::vector<std::unique_ptr<PC_MCFE_Client>> clients_;
     std::unique_ptr<PC_MCFE_Server> server_;
     std::vector<mcl::bn::Fr> weights_;
-    std::pair<std::vector<mcl::bn::Fr>, mcl::bn::Fr> aggregate_key_;
+    DmcfeFunctionalKey2 aggregate_key_;
 
     struct PlaintextOracleLayer {
         int rows = 0;

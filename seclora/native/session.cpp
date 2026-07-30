@@ -217,22 +217,20 @@ void append_unique(std::vector<int>& values, int value) {
 }
 
 std::size_t a_slot_bytes(const A_Ciphertext_Slot& slot) {
-    std::size_t bytes = slot.c_i.getStr(mcl::IoSerialize).size();
-    if (!slot.is_zero) {
-        bytes += slot.ife_c1.getStr(mcl::IoSerialize).size();
-        for (const auto& value : slot.ife_c2) {
-            bytes += value.getStr(mcl::IoSerialize).size();
-        }
+    std::size_t bytes =
+        slot.ife_c1.getStr(mcl::IoSerialize).size();
+    for (const auto& value : slot.ife_c2) {
+        bytes += value.getStr(mcl::IoSerialize).size();
     }
+    bytes += static_cast<std::size_t>(
+        ABG19DmcfeMask2::SerializedBytes(slot.dfe_ct));
     return bytes;
 }
 
 std::size_t b_slot_bytes(const B_SecretKey_Slot& slot) {
     std::size_t bytes = slot.ife_k1.getStr(mcl::IoSerialize).size();
-    if (!slot.is_zero) {
-        for (const auto& value : slot.ife_k2) {
-            bytes += value.getStr(mcl::IoSerialize).size();
-        }
+    for (const auto& value : slot.ife_k2) {
+        bytes += value.getStr(mcl::IoSerialize).size();
     }
     return bytes;
 }
@@ -287,29 +285,26 @@ SelectiveTwoServerSession::SelectiveTwoServerSession(
     bsgs_bound_ = checked_int64(wide_bound, "public BSGS bound");
 
     hashAndMapToG1(pp_.g0, "base_g0", 7);
-    hashAndMapToG1(pp_.g1, "base_g1", 7);
-    hashAndMapToG1(pp_.h_blinding, "blinding_h", 10);
     hashAndMapToG2(pp_.g2_base, "base_g2", 7);
 
-    pp_.cmt_s.resize(num_clients_);
+    std::vector<DmcfeClientSecret2> dfe_secrets;
+    ABG19DmcfeMask2::Setup(
+        num_clients_, pp_.g0, dfe_pp_, dfe_secrets);
     clients_.reserve(num_clients_);
     for (int client_id = 0; client_id < num_clients_; ++client_id) {
         clients_.emplace_back(
-            new PC_MCFE_Client(client_id, rank_, pp_));
-        pp_.cmt_s[client_id] = clients_.back()->GetCommitment();
+            new PC_MCFE_Client(
+                client_id, rank_, pp_, dfe_pp_,
+                dfe_secrets[static_cast<size_t>(client_id)]));
     }
-    server_.reset(new PC_MCFE_Server(num_clients_, pp_));
+    server_.reset(new PC_MCFE_Server(num_clients_, pp_, dfe_pp_));
 
     weights_.assign(num_clients_, Fr(1));
-    std::vector<std::pair<std::vector<Fr>, Fr>> shares(num_clients_);
+    std::vector<DmcfeKeyShare2> shares(num_clients_);
     for (int client_id = 0; client_id < num_clients_; ++client_id) {
         shares[client_id] = clients_[client_id]->KeyGenShare(weights_);
     }
-    aggregate_key_ = server_->AggregateKeys(shares);
-    if (!server_->VerifyKey(
-            weights_, aggregate_key_.first, aggregate_key_.second)) {
-        throw std::runtime_error("PC-MCFE aggregate key verification failed");
-    }
+    aggregate_key_ = server_->DKeyComb(shares);
 
     GT base;
     pairing(base, pp_.g0, pp_.g2_base);
@@ -627,6 +622,20 @@ SelectiveTwoServerSession::aggregate_round(
             a_refs.push_back(&layer.encrypted_a);
             b_refs.push_back(&layer.encrypted_b);
         }
+        std::vector<int> encrypted_cols;
+        for (int col = 0; col < ea; ++col) {
+            encrypted_cols.push_back(col);
+        }
+        if (eb > 0) {
+            for (int col : first.candidate_cols) {
+                append_unique(encrypted_cols, col);
+            }
+        }
+        std::sort(encrypted_cols.begin(), encrypted_cols.end());
+        double dfe_worker_seconds = 0.0;
+        server_->PrepareDfeMaskCacheRefs(
+            a_refs, weights_, aggregate_key_, encrypted_cols,
+            threads_, dfe_worker_seconds);
 
         IntMat cached_c(
             rows, std::vector<long long>(available_rank, 0));
@@ -688,7 +697,7 @@ SelectiveTwoServerSession::aggregate_round(
                 static_cast<int>(work.size()), threads_, [&](int index) {
                     const DecryptCell& cell = work[index];
                     GT group = server_->eval_one_cell_group_refs(
-                        a_refs, b_refs, weights_, aggregate_key_,
+                        a_refs, b_refs, weights_,
                         first.layer_id, 0, round_id, cell.row, cell.col);
                     bool cell_found = false;
                     decrypted[index] =

@@ -34,28 +34,44 @@ endif()
 add_subdirectory("${SECLORA_MCL_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/mcl")
 
 set(SECLORA_CORE_SOURCES
+    core/dmcfe_mask.cpp
     core/ife_fh_core.cpp
     core/pc_mcfe_client.cpp
     core/pc_mcfe_server.cpp
 )
 
-pybind11_add_module(
-    _seclora_native
-    bindings.cpp
+add_library(
+    seclora_native_core STATIC
     session.cpp
     ${SECLORA_CORE_SOURCES}
 )
 target_include_directories(
-    _seclora_native
-    PRIVATE
+    seclora_native_core
+    PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}"
     "${CMAKE_CURRENT_SOURCE_DIR}/core"
     "${SECLORA_MCL_DIR}/include"
 )
+target_compile_options(seclora_native_core PRIVATE -O3)
+target_link_libraries(
+    seclora_native_core PUBLIC mcl mclbn256 pthread)
+
+pybind11_add_module(
+    _seclora_native
+    bindings.cpp
+)
 target_compile_options(_seclora_native PRIVATE -O3)
-target_link_libraries(_seclora_native PRIVATE mcl mclbn256 pthread)
+target_link_libraries(_seclora_native PRIVATE seclora_native_core)
 set_target_properties(
     _seclora_native
     PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
 )
+
+add_executable(
+    seclora_session_selftest
+    tests/session_selftest.cpp
+)
+target_compile_options(seclora_session_selftest PRIVATE -O3)
+target_link_libraries(
+    seclora_session_selftest PRIVATE seclora_native_core)

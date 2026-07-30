@@ -49,7 +49,7 @@ python main.py --config configs/seclora_end_to_end.yaml
 ```
 
 配置默认使用 4 客户端、10% 选择性加密、`Sfp=22`、`Xmax=0.03125` 和
-48 线程。原生后端复用全局 PC-MCFE 参数、聚合密钥和 BSGS 表，每轮返回
+48 线程。原生后端复用全局 PC-DMCFE 参数、聚合密钥和 BSGS 表，每轮返回
 `C/M/S` 骨架并压回配置的 LoRA rank。协议边界与当前限制见
 [seclora/README.md](./seclora/README.md)。
 
