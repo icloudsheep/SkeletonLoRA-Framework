@@ -248,7 +248,9 @@ walk_tree() {
 finalize_filelist() {
     local mf="$LOCAL_DIR/.hfd/manifest"
     : > "$mf"
-    awk -F'\t' -v mf="$mf" '!seen[$2]++ { print >> mf; n++; s+=$1 } END { print (n+0)" "(s+0) }' \
+    awk -F'\t' -v mf="$mf" \
+        '!seen[$2]++ { print >> mf; n++; s+=$1 }
+         END { printf "%d %.0f\n", n+0, s+0 }' \
         "$LOCAL_DIR/.hfd/manifest.partial" > "$LOCAL_DIR/.hfd/filelist_stats"
 }
 
@@ -371,7 +373,7 @@ monitor_progress() {
                 { p=$2; sub(/^\.\//,"",p)
                   if (p ~ /\.aria2$/) { sub(/\.aria2$/,"",p); if (p in want) a++; next }
                   if (p in want) { b+=$1; d++ } }
-                END { print b*512, d-a }
+                END { printf "%.0f %d\n", b*512, d-a }
             ' .hfd/manifest <(find . -type f ! -path './.hfd/*' -printf '%b\t%p\n' 2>/dev/null))
             render_progress "$now" "$files"
             # Self-throttle: if the walk took longer than the base interval, sleep that long
