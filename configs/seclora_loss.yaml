@@ -1,0 +1,48 @@
+# SecLoRA SEL-2S convergence config derived from loss.yaml.
+
+seed: 42
+
+federated:
+  num_clients: 2
+  num_rounds: 20
+  local_steps: 300
+
+lora:
+  rank: 4
+  alpha: 8
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+train:
+  batch_size: 2
+  learning_rate: 2.0e-4
+  optimizer: adamw
+  weight_decay: 0.0
+  dtype: float32
+  loss_moving_average_window: 20
+
+model:
+  kind: open_llama
+  name: open_llama_3b_v2
+  path: ./models/open_llama_3b_v2
+  dtype: float32
+
+dataset:
+  kind: natural_instructions
+  split_method: iid_uniform
+  path: ./datasets/natural-instructions
+  max_length: 1024
+  max_samples: 20000
+
+secure_aggregation:
+  backend: seclora
+  mode: sel-2s
+  ratio: 0.01
+  sfp: 22
+  xmax: 0.03125
+  threads: 25
+
+logging:
+  level: INFO
+
+tensorboard:
+  port: 6006
