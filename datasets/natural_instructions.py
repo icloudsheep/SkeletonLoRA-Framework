@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import random
 from pathlib import Path
@@ -18,6 +19,9 @@ from datasets.dolly import (
     _truncate_prompt,
     _truncate_response,
 )
+
+
+logger = logging.getLogger("skeleton_lora")
 
 
 def build_natural_instructions_shards(config: dict) -> List[Dataset]:
@@ -71,6 +75,11 @@ def build_natural_instructions_shards(config: dict) -> List[Dataset]:
 
     if not encoded:
         raise ValueError(f"Natural Instructions 训练集为空: {dataset_cfg['path']}")
+    logger.info(
+        "Natural Instructions 数据集已编码: 有效样本=%d max_length=%d",
+        len(encoded),
+        max_length,
+    )
     dataset = TokenizedCausalLMDataset(
         input_ids=torch.stack([sample["input_ids"] for sample in encoded]),
         attention_mask=torch.stack([sample["attention_mask"] for sample in encoded]),
@@ -110,6 +119,8 @@ def _iter_records(
         else None
     )
     emitted = 0
+    skipped_empty_targets = 0
+    overflow_files: list[Path] = []
     for path in ordered_files:
         emitted_from_file = 0
         with path.open(encoding="utf-8") as stream:
@@ -120,13 +131,59 @@ def _iter_records(
                     record = json.loads(line)
                 except json.JSONDecodeError as exc:
                     raise ValueError(f"{path} 第 {line_number} 行无法解析") from exc
+                if _has_empty_target(record):
+                    skipped_empty_targets += 1
+                    continue
                 yield record, f"{path}:{line_number}"
                 emitted += 1
                 emitted_from_file += 1
                 if max_samples is not None and emitted >= max_samples:
+                    _log_skipped_empty_targets(skipped_empty_targets)
                     return
                 if per_file_limit is not None and emitted_from_file >= per_file_limit:
+                    overflow_files.append(path)
                     break
+
+    if max_samples is not None and emitted < max_samples:
+        for path in overflow_files:
+            valid_seen = 0
+            with path.open(encoding="utf-8") as stream:
+                for line_number, line in enumerate(stream, start=1):
+                    if not line.strip():
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError as exc:
+                        raise ValueError(f"{path} 第 {line_number} 行无法解析") from exc
+                    if _has_empty_target(record):
+                        if valid_seen >= per_file_limit:
+                            skipped_empty_targets += 1
+                        continue
+                    valid_seen += 1
+                    if valid_seen <= per_file_limit:
+                        continue
+                    yield record, f"{path}:{line_number}"
+                    emitted += 1
+                    if emitted >= max_samples:
+                        _log_skipped_empty_targets(skipped_empty_targets)
+                        return
+    _log_skipped_empty_targets(skipped_empty_targets)
+
+
+def _has_empty_target(record: object) -> bool:
+    """识别无法产生 causal-LM 监督信号的空目标。"""
+    if not isinstance(record, dict):
+        return False
+    target = record.get("targets")
+    return isinstance(target, str) and not target.strip()
+
+
+def _log_skipped_empty_targets(count: int) -> None:
+    if count:
+        logger.warning(
+            "Natural Instructions 已跳过空 targets 样本: count=%d",
+            count,
+        )
 
 
 def _encode_record(
@@ -141,10 +198,12 @@ def _encode_record(
     prompt_ids = tokenizer(
         _format_prompt(validated["definition"], validated["inputs"]),
         add_special_tokens=True,
+        verbose=False,
     )["input_ids"]
     response_ids = tokenizer(
         validated["targets"],
         add_special_tokens=False,
+        verbose=False,
     )["input_ids"]
     eos_token_id = tokenizer.eos_token_id
     if eos_token_id is not None and (not response_ids or response_ids[-1] != eos_token_id):
