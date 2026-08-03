@@ -3,13 +3,14 @@ set -e
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 CONFIGS=(
-    loss-AB-1-Skeleton-NI.yaml
-    loss-AB-1-NI.yaml
-#    ckks-AB-1.yaml
-#    ckks-AB-10-Skeleton.yaml
-#    ckks-AB-10.yaml
-#    ckks-AB-25-Skeleton.yaml
-#    ckks-AB-25.yaml
+    ckks-AB-0.yaml
+    ckks-AB-0-Skeleton.yaml
+    loss-AB-0-NI.yaml
+    loss-AB-0-Skeleton-NI.yaml
+    ckks-7b-AB-1.yaml
+    ckks-7b-AB-1-Skeleton.yaml
+    ckks-7b-AB-0.yaml
+    ckks-7b-AB-0-Skeleton.yaml
 )
 
 for config in "${CONFIGS[@]}"; do
@@ -25,4 +26,4 @@ done
 #bash evaluate.sh configs/ckks-AB-25.yaml "3B-AB-25-MMLU" mmlu
 
 echo "[autorun] all done, shutting down"
-#/usr/bin/shutdown -h now
+/usr/bin/shutdown -h now
