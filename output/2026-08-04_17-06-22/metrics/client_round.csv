@@ -1,0 +1,2 @@
+round,client_id,steps,mean_loss,token_weighted_mean_loss,min_loss,max_loss,final_loss,final_moving_avg_loss,perplexity,supervised_tokens,mean_step_time,train_time
+1,0,300,1.25314805885156,1.1907864877374432,0.12001010775566101,4.960049629211426,1.0005184412002563,1.2197740636765957,3.289667473344623,6934,0.5106745195699235,153.3533989265561

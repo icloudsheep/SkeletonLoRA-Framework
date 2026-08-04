@@ -5,7 +5,7 @@ seed: 42
 federated:
   num_clients: 4
   num_rounds: 3
-  local_steps: 300
+  local_steps: 500
 
 lora:
   rank: 4
@@ -13,7 +13,7 @@ lora:
   target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
 
 train:
-  batch_size: 4
+  batch_size: 1
   learning_rate: 2.0e-4
   optimizer: adamw
   weight_decay: 0.0
