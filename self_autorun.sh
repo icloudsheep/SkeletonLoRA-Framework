@@ -3,7 +3,10 @@ set -e
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 CONFIGS=(
-    l
+    modern_loss-3b-AB-1-Skeleton-NI.yaml
+    modern_loss-3b-AB-1-NI.yaml
+    modern_loss-7b-AB-1-Skeleton-NI.yaml
+    modern_loss-7b-AB-1-NI.yaml
 )
 
 for config in "${CONFIGS[@]}"; do

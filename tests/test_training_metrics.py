@@ -7,7 +7,11 @@ import unittest
 
 import torch
 
-from training_progress import _perplexity, _supervised_token_count
+from training_progress import (
+    _learning_rate_at_step,
+    _perplexity,
+    _supervised_token_count,
+)
 from utils.metrics import CLIENT_ROUND_COLS, STEP_COLS, CsvWriters
 
 
@@ -19,6 +23,61 @@ class TrainingMetricsTest(unittest.TestCase):
     def test_perplexity_is_exponential_cross_entropy(self) -> None:
         self.assertAlmostEqual(_perplexity(2.0, "open_llama"), math.exp(2.0))
         self.assertTrue(math.isnan(_perplexity(2.0, "dummy")))
+
+    def test_cosine_learning_rate_uses_warmup_and_reaches_minimum(self) -> None:
+        train_config = {
+            "learning_rate": 2.0e-4,
+            "lr_scheduler": {
+                "type": "cosine",
+                "warmup_steps": 2,
+                "min_learning_rate": 2.0e-5,
+            },
+        }
+
+        self.assertAlmostEqual(
+            _learning_rate_at_step(train_config, 0, total_steps=6),
+            1.0e-4,
+        )
+        self.assertAlmostEqual(
+            _learning_rate_at_step(train_config, 1, total_steps=6),
+            2.0e-4,
+        )
+        self.assertAlmostEqual(
+            _learning_rate_at_step(train_config, 2, total_steps=6),
+            2.0e-4,
+        )
+        self.assertAlmostEqual(
+            _learning_rate_at_step(train_config, 5, total_steps=6),
+            2.0e-5,
+        )
+
+    def test_learning_rate_defaults_to_constant(self) -> None:
+        train_config = {"learning_rate": 2.0e-4}
+
+        self.assertEqual(
+            _learning_rate_at_step(train_config, 4, total_steps=6),
+            2.0e-4,
+        )
+
+    def test_learning_rate_rejects_invalid_boundaries(self) -> None:
+        with self.assertRaisesRegex(ValueError, "learning_rate"):
+            _learning_rate_at_step(
+                {"learning_rate": float("nan")},
+                0,
+                total_steps=6,
+            )
+        with self.assertRaisesRegex(ValueError, "warmup_steps"):
+            _learning_rate_at_step(
+                {
+                    "learning_rate": 2.0e-4,
+                    "lr_scheduler": {
+                        "type": "cosine",
+                        "warmup_steps": 6,
+                    },
+                },
+                0,
+                total_steps=6,
+            )
 
     def test_csv_files_include_step_and_client_round_metrics(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
