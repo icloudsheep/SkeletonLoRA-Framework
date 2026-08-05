@@ -8,6 +8,7 @@ RUN_ID="${2:-}"
 TARGET="${3:-train}"
 FOURTH_ARG="${4:-}"
 FIFTH_ARG="${5:-}"
+OUTPUT_TAG="${6:-}"
 EXPECTED_ENV="skeleton_lora_fe"
 
 if [[ "$FOURTH_ARG" == "adapter" || "$FOURTH_ARG" == "base" ]]; then
@@ -25,7 +26,7 @@ fi
 
 if [[ -z "$RUN_ID" ]]; then
     echo "[evaluate.sh] 错误：run-id 不能为空"
-    echo "[evaluate.sh] 用法：bash evaluate.sh [config] <run-id> [train|mmlu|gsm8k] [adapter|base] [evaluation-config]"
+    echo "[evaluate.sh] 用法：bash evaluate.sh [config] <run-id> [train|mmlu|gsm8k] [adapter|base] [evaluation-config] [output-tag]"
     echo "[evaluate.sh] 示例：bash evaluate.sh configs/ckks.yaml 2026-07-27_19-31-58 mmlu"
     echo "[evaluate.sh] 原生：bash evaluate.sh configs/ckks.yaml 2026-07-27_19-31-58 mmlu base"
     exit 1
@@ -71,10 +72,17 @@ echo "[evaluate.sh] run_id=$RUN_ID"
 echo "[evaluate.sh] target=$TARGET"
 echo "[evaluate.sh] model_mode=$MODEL_MODE"
 echo "[evaluate.sh] evaluation_config=$EVALUATION_CONFIG"
+echo "[evaluate.sh] output_tag=${OUTPUT_TAG:-none}"
+
+OUTPUT_ARGS=()
+if [[ -n "$OUTPUT_TAG" ]]; then
+    OUTPUT_ARGS=(--output-tag "$OUTPUT_TAG")
+fi
 
 "$PYTHON" "$ROOT/evaluate.py" \
     --config "$CONFIG" \
     --run-id "$RUN_ID" \
     --target "$TARGET" \
     --model-mode "$MODEL_MODE" \
-    --evaluation-config "$EVALUATION_CONFIG"
+    --evaluation-config "$EVALUATION_CONFIG" \
+    "${OUTPUT_ARGS[@]}"

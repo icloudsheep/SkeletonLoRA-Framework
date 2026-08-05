@@ -48,6 +48,16 @@ class EvaluateModeTest(unittest.TestCase):
         self.assertEqual("mmlu.csv", _output_filename("mmlu", "adapter"))
         self.assertEqual("mmlu_base.csv", _output_filename("mmlu", "base"))
         self.assertEqual("eval_base.csv", _output_filename("train", "base"))
+        self.assertEqual(
+            "mmlu_subject_v1.csv",
+            _output_filename("mmlu", "adapter", "subject_v1"),
+        )
+        self.assertEqual(
+            "mmlu_base_subject_v1.csv",
+            _output_filename("mmlu", "base", "subject_v1"),
+        )
+        with self.assertRaisesRegex(ValueError, "output-tag"):
+            _output_filename("mmlu", "adapter", "../invalid")
 
         fields, rows = _add_model_mode(
             ["run_id", "accuracy"],

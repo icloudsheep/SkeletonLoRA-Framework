@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import re
 import time
 from pathlib import Path
 
@@ -42,7 +43,15 @@ def main() -> None:
         default="adapter",
         help="adapter 加载聚合 LoRA，base 只评测原始底座模型",
     )
+    parser.add_argument(
+        "--output-tag",
+        default="",
+        help="附加到结果文件名的标签，用于保留同一评测的不同口径",
+    )
     args = parser.parse_args()
+    output_filename = _output_filename(
+        args.target, args.model_mode, args.output_tag
+    )
 
     root = Path(__file__).parent
     config = load_yaml(args.config)
@@ -70,16 +79,20 @@ def main() -> None:
         fieldnames, rows = _add_model_mode(
             result.fieldnames, result.rows, args.model_mode
         )
-        output_path = run_dir / "metrics" / _output_filename(
-            args.target, args.model_mode
-        )
+        output_path = run_dir / "metrics" / output_filename
         _write_rows(output_path, fieldnames, rows)
         print(f"[evaluate] {result.summary}")
         print(f"[evaluate] 全部完成: 结果已保存到 {output_path}")
         return
 
     _evaluate_training_shards(
-        model, config, device, run_dir, args.run_id, args.model_mode
+        model,
+        config,
+        device,
+        run_dir,
+        args.run_id,
+        args.model_mode,
+        output_filename,
     )
 
 
@@ -113,6 +126,7 @@ def _evaluate_training_shards(
     run_dir: Path,
     run_id: str,
     model_mode: str,
+    output_filename: str,
 ) -> None:
     shards = build_shards(config)
     rows = []
@@ -145,7 +159,7 @@ def _evaluate_training_shards(
             f"loss={loss:.6f} perplexity={perplexity:.6f} elapsed={elapsed:.1f}s"
         )
 
-    output_path = run_dir / "metrics" / _output_filename("train", model_mode)
+    output_path = run_dir / "metrics" / output_filename
     _write_rows(
         output_path,
         ["run_id", "model_mode", "client_id", "loss", "perplexity"],
@@ -166,10 +180,13 @@ def _add_model_mode(
     return output_fieldnames, output_rows
 
 
-def _output_filename(target: str, model_mode: str) -> str:
+def _output_filename(target: str, model_mode: str, output_tag: str = "") -> str:
+    if output_tag and re.fullmatch(r"[A-Za-z0-9_-]+", output_tag) is None:
+        raise ValueError("output-tag 只能包含字母、数字、下划线或连字符")
     stem = "eval" if target == "train" else target
-    suffix = "_base" if model_mode == "base" else ""
-    return f"{stem}{suffix}.csv"
+    mode_suffix = "_base" if model_mode == "base" else ""
+    tag_suffix = f"_{output_tag}" if output_tag else ""
+    return f"{stem}{mode_suffix}{tag_suffix}.csv"
 
 
 def _write_rows(path: Path, fieldnames: list[str], rows: list[dict]) -> None:

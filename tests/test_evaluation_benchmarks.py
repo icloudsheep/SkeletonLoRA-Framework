@@ -11,7 +11,7 @@ from evaluation.gsm8k import (
     extract_reference_answer,
     load_gsm8k_records,
 )
-from evaluation.mmlu import evaluate_mmlu, load_mmlu_records
+from evaluation.mmlu import _format_prompt, evaluate_mmlu, load_mmlu_records
 
 
 class EvaluationBenchmarkTest(unittest.TestCase):
@@ -29,6 +29,35 @@ class EvaluationBenchmarkTest(unittest.TestCase):
         self.assertEqual(1, len(records))
         self.assertEqual("abstract_algebra", records[0]["subject"])
         self.assertEqual("B", records[0]["answer"])
+
+    def test_mmlu_prompt_contains_subject(self):
+        prompt = _format_prompt(
+            {
+                "question": "What is 1+1?",
+                "choices": ["1", "2", "3", "4"],
+                "subject": "abstract_algebra",
+            }
+        )
+
+        self.assertIn("Subject: abstract_algebra\nQuestion: What is 1+1?", prompt)
+
+    def test_mmlu_jsonl_rejects_missing_or_empty_subject(self):
+        invalid_records = [
+            {"question": "Q", "choices": ["A", "B", "C", "D"], "answer": 0},
+            {
+                "question": "Q",
+                "choices": ["A", "B", "C", "D"],
+                "answer": 0,
+                "subject": "",
+            },
+        ]
+        for record in invalid_records:
+            with self.subTest(record=record), tempfile.TemporaryDirectory() as tmp_dir:
+                path = Path(tmp_dir) / "mmlu.jsonl"
+                path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+                with self.assertRaisesRegex(ValueError, "subject 无效"):
+                    load_mmlu_records(path)
 
     @patch("evaluation.mmlu.load_local_tokenizer", return_value=object())
     @patch("evaluation.mmlu.completion_log_probability")
@@ -86,6 +115,10 @@ class EvaluationBenchmarkTest(unittest.TestCase):
         self.assertEqual(summaries[("subject", "math")]["accuracy"], 0.5)
         self.assertEqual(summaries[("subject", "history")]["accuracy"], 1.0)
         self.assertEqual(sum(row["row_type"] == "question" for row in result.rows), 3)
+        self.assertEqual(
+            {"subject_v1"},
+            {row["prompt_version"] for row in result.rows},
+        )
 
     def test_loads_standard_gsm8k_jsonl_and_extracts_answers(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

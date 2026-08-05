@@ -1,4 +1,4 @@
-"""MMLU 本地数据加载与零样本四选一准确率评测。"""
+"""MMLU 本地数据加载与带学科上下文的零样本四选一准确率评测。"""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from evaluation.common import (
 
 
 CHOICE_LABELS = ("A", "B", "C", "D")
+PROMPT_VERSION = "subject_v1"
 
 
 def evaluate_mmlu(
@@ -60,6 +61,7 @@ def evaluate_mmlu(
             {
                 "run_id": run_id,
                 "benchmark": "mmlu",
+                "prompt_version": PROMPT_VERSION,
                 "row_type": "question",
                 "subject": record["subject"],
                 "question_id": index,
@@ -77,6 +79,7 @@ def evaluate_mmlu(
         {
             "run_id": run_id,
             "benchmark": "mmlu",
+            "prompt_version": PROMPT_VERSION,
             "row_type": "overall",
             "subject": "ALL",
             "correct_count": correct_count,
@@ -88,6 +91,7 @@ def evaluate_mmlu(
         {
             "run_id": run_id,
             "benchmark": "mmlu",
+            "prompt_version": PROMPT_VERSION,
             "row_type": "subject",
             "subject": subject,
             "correct_count": correct,
@@ -104,6 +108,7 @@ def evaluate_mmlu(
         fieldnames=[
             "run_id",
             "benchmark",
+            "prompt_version",
             "row_type",
             "subject",
             "question_id",
@@ -175,7 +180,7 @@ def _load_jsonl(path: Path) -> list[dict]:
                     raw.get("question"),
                     raw.get("choices"),
                     raw.get("answer"),
-                    raw.get("subject", path.stem),
+                    raw.get("subject"),
                     path,
                     line_number,
                 )
@@ -195,11 +200,13 @@ def _validate_record(question, choices, answer, subject, path: Path, line_number
     answer = str(answer).strip().upper()
     if answer not in CHOICE_LABELS:
         raise ValueError(f"MMLU {path} 第 {line_number} 行 answer 必须为 A/B/C/D 或 0-3")
+    if not isinstance(subject, str) or not subject.strip():
+        raise ValueError(f"MMLU {path} 第 {line_number} 行 subject 无效")
     return {
         "question": question.strip(),
         "choices": [choice.strip() for choice in choices],
         "answer": answer,
-        "subject": str(subject).strip() or "unknown",
+        "subject": subject.strip(),
     }
 
 
@@ -210,5 +217,6 @@ def _format_prompt(record: dict) -> str:
     )
     return (
         "The following is a multiple choice question. Choose the correct answer.\n\n"
+        f"Subject: {record['subject']}\n"
         f"Question: {record['question']}\n{options}\nAnswer:"
     )
