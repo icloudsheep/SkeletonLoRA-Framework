@@ -1,10 +1,10 @@
-# Convergence config: Natural Instructions with multiple clients and rounds.
+# Default training config extended with SkeletonLoRA CKKS aggregation.
 
 seed: 42
 
 federated:
   num_clients: 2
-  num_rounds: 20
+  num_rounds: 100
   local_steps: 300
 
 lora:
@@ -17,14 +17,14 @@ train:
   learning_rate: 2.0e-4
   optimizer: adamw
   weight_decay: 0.0
-  dtype: bfloat16
+  dtype: float32
   loss_moving_average_window: 20
 
 model:
   kind: open_llama
-  name: open_llama_7b_v2
-  path: ./models/open_llama_7b_v2
-  dtype: bfloat16
+  name: open_llama_3b_v2
+  path: ./models/open_llama_3b_v2
+  dtype: float32
 
 dataset:
   kind: natural_instructions
@@ -32,6 +32,17 @@ dataset:
   path: ./datasets/natural-instructions
   max_length: 1024
   max_samples: 20000
+
+encryption:
+  scheme: ckks
+  mode: partial_AB
+  ratio: 1
+  skeleton: true
+  skeleton_rank: 16
+  poly_modulus_degree: 8192
+  coeff_mod_bit_sizes: [60, 40, 40, 60]
+  global_scale: 1099511627776
+  cur_condition_threshold: 1.0e12
 
 logging:
   level: INFO
