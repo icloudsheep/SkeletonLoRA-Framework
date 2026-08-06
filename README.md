@@ -51,10 +51,17 @@ python main.py --config configs/seclora_3b_sel2s_010.yaml
 3B 配置覆盖 0.125%、1%、10%、25% `SEL-2S`、`FULL+SK`、20 轮旧 Loss
 和 100 轮新 Loss。统一使用 `Sfp=22`、`Xmax=0.03125` 和 25 线程。
 选择性模式会一次加密上传 `2*K*R` 主元候选池，该成本已进入在线时间和
-通信量。完整流水线入口为 `bash run_seclora_3b_pipeline.sh`，依次执行五次
-独立训练、五次 MMLU adapter 评估和 100 轮 modern-loss 实验。协议边界、
-计时与通信口径见
+通信量。当前 3B 第二阶段入口为 `bash run_seclora_3b_stage2.sh`：复用已经
+完成的 0.125%/1% run 并评估 MMLU，运行 1% modern loss，再独立训练和
+评估 10%/25%。FULL+SK 与 0% 不在该脚本中。协议边界、计时与通信口径见
 [seclora/README.md](./seclora/README.md)。
+
+第二阶段默认续写最新的 `output/seclora_3b_pipeline_*`，也可通过
+`SECLORA_PIPELINE_DIR` 显式指定目录。已有 `run_ids.tsv` 和
+`pipeline.log` 会去重追加，不会被覆盖。
+
+`run_seclora_3b_pipeline.sh` 作为从头运行选择性比例的参考脚本保留；
+FULL+SK 条目已注释，除非后续明确恢复，否则不会由该脚本启动。
 
 ## 下载资源
 

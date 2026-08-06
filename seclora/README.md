@@ -233,16 +233,23 @@ bash run_seclora_3b.sh full-sk
 bash run_seclora_3b.sh legacy-loss
 bash run_seclora_3b.sh modern-loss
 bash run_seclora_3b_pipeline.sh
+bash run_seclora_3b_stage2.sh
 ```
 
 Batch runs use the config stem as a run-id prefix and copy the exact YAML to
-`output/<run-id>/experiment.yaml`. The pipeline runs the four SEL-2S ratios and
-FULL+SK first, evaluates every resulting adapter on MMLU, and then runs only
-the 100-round modern-loss configuration. It stores its run-id map, combined
-log, and SecLoRA rolling-loss plot under
-`output/seclora_3b_pipeline_<timestamp>/`. After a modern-loss run, plot its
-rolling curve alone or beside other methods with repeatable `--series`
+`output/<run-id>/experiment.yaml`. The stage-2 script discovers completed
+0.125% and 1% runs, evaluates them on MMLU, runs the 1% 100-round modern-loss
+configuration, and then trains and evaluates 10% and 25%. It intentionally
+does not run 0%, legacy loss, or FULL+SK. Its run-id map, combined log, and
+SecLoRA rolling-loss plot are appended to the latest existing
+`output/seclora_3b_pipeline_<timestamp>/` directory. Set
+`SECLORA_PIPELINE_DIR` to select one explicitly. After a modern-loss run, plot
+its rolling curve alone or beside other methods with repeatable `--series`
 arguments:
+
+`run_seclora_3b_pipeline.sh` remains as a fresh selective-sweep reference. Its
+FULL+SK array entries are commented out, so the script runs only the four
+SEL-2S ratios, their MMLU evaluations, and modern loss.
 
 ```bash
 python plot_seclora_loss.py \

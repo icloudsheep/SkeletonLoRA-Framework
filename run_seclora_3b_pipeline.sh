@@ -23,14 +23,15 @@ TRAIN_LABELS=(
     "sel2s-1pct"
     "sel2s-10pct"
     "sel2s-25pct"
-    "full-sk"
+    # FULL+SK is retained in the repository but paused for this experiment.
+    # "full-sk"
 )
 TRAIN_CONFIGS=(
     "configs/seclora_3b_sel2s_000125.yaml"
     "configs/seclora_3b_sel2s_001.yaml"
     "configs/seclora_3b_sel2s_010.yaml"
     "configs/seclora_3b_sel2s_025.yaml"
-    "configs/seclora_3b_full_sk.yaml"
+    # "configs/seclora_3b_full_sk.yaml"
 )
 MODERN_LOSS_CONFIG="configs/seclora_loss_3b_modern_001.yaml"
 
@@ -102,14 +103,14 @@ evaluate_one() {
 
 echo "[pipeline] id=$PIPELINE_ID"
 echo "[pipeline] output=$PIPELINE_DIR"
-echo "[pipeline] phase 1/3: five independent end-to-end training runs"
+echo "[pipeline] phase 1/3: four independent SEL-2S training runs"
 printf 'label\tconfig\trun_id\n' > "$RUN_MAP"
 for index in "${!TRAIN_CONFIGS[@]}"; do
     train_one "${TRAIN_LABELS[$index]}" "${TRAIN_CONFIGS[$index]}"
 done
 
 echo
-echo "[pipeline] phase 2/3: MMLU adapter evaluation for all five runs"
+echo "[pipeline] phase 2/3: MMLU adapter evaluation for all four runs"
 while IFS=$'\t' read -r label config run_id; do
     [[ "$label" == "label" ]] && continue
     evaluate_one "$label" "$config" "$run_id"
