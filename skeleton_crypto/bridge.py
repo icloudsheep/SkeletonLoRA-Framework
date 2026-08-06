@@ -25,10 +25,13 @@ import torch
 from skeleton_crypto.fe_context import create_secret_context, derive_public_context
 from skeleton_crypto.fe_modes import build_partition
 from skeleton_crypto.fe_outer_hybrid import (
+    accumulate_block,
     aggregate,
     build_blocks,
     decrypt_result,
     encrypt_upload,
+    finalize_block,
+    iter_block_uploads,
 )
 from skeleton_crypto.fe_skeleton import cur_reconstruct_with_stats, select_uniform_rect_indices
 from skeleton_crypto.process_worker import (
@@ -59,7 +62,7 @@ class CryptoConfig:
 class SkeletonLoRACrypto:
     """Encrypt, aggregate and decrypt LoRA A/B pairs with CKKS."""
 
-    protocol = "skeleton_lora_ckks_v1"
+    protocol = "skeleton_lora_ckks_v2"
 
     def __init__(self, config: dict, *, num_clients: int, rank: int) -> None:
         self.config = _parse_config(config)
@@ -133,36 +136,156 @@ class SkeletonLoRACrypto:
             "layers": layers,
         }
 
-    def secure_aggregate(self, ciphertexts: list[tuple[int, dict]], round_id: int) -> dict[str, torch.Tensor]:
-        """Aggregate encrypted LoRA products and return factorized A/B tensors."""
+    def aggregate_encrypted(
+        self,
+        ciphertexts: list[tuple[int, dict]],
+        round_id: int,
+    ) -> dict[str, Any]:
+        """使用公钥聚合客户端上传，返回尚未解密的分层 payload。"""
         packages = self._validate_packages(ciphertexts, round_id)
         first_layers = packages[0]["layers"]
-        output: dict[str, torch.Tensor] = {}
+        layers = {}
         for a_key in sorted(first_layers):
             layer_packages = [package["layers"][a_key] for package in packages]
             self._validate_layer_metadata(a_key, layer_packages)
-            encrypted_product = aggregate(
-                [layer["upload"] for layer in layer_packages],
-                self.public_context,
-                self.num_clients,
-            )
-            product, _ = decrypt_result(encrypted_product, self.secret_context)
-            if self.config.skeleton:
-                product = self._reconstruct_product(a_key, product, layer_packages[0])
-            product_tensor = torch.from_numpy(np.asarray(product, dtype=np.float32))
-            b_new, a_new = factorize_lora_product(product_tensor, self.rank)
             first = layer_packages[0]
-            output[a_key] = a_new.to(dtype=first["a_dtype"])
-            output[first["b_key"]] = b_new.to(dtype=first["b_dtype"])
+            layers[a_key] = {
+                "protocol": self.protocol,
+                "round_id": round_id,
+                "a_key": a_key,
+                "b_key": first["b_key"],
+                "a_dtype": str(first["a_dtype"]),
+                "b_dtype": str(first["b_dtype"]),
+                "skeleton_rows": first["skeleton_rows"],
+                "skeleton_cols": first["skeleton_cols"],
+                "aggregate_result": aggregate(
+                    [layer["upload"] for layer in layer_packages],
+                    self.public_context,
+                    self.num_clients,
+                ),
+            }
+        return {
+            "protocol": self.protocol,
+            "round_id": round_id,
+            "layers": layers,
+        }
+
+    def decrypt_aggregate(
+        self,
+        aggregate_payload: dict[str, Any],
+        round_id: int,
+    ) -> dict[str, torch.Tensor]:
+        """解密分层聚合 payload，并重建为 LoRA A/B tensors。"""
+        if aggregate_payload.get("protocol") != self.protocol:
+            raise ValueError("聚合 payload 的协议不匹配")
+        if aggregate_payload.get("round_id") != round_id:
+            raise ValueError("聚合 payload 的轮次不匹配")
+        layers = aggregate_payload.get("layers")
+        if not isinstance(layers, dict) or not layers:
+            raise ValueError("聚合 payload 不包含有效层")
+        output: dict[str, torch.Tensor] = {}
+        for a_key in sorted(layers):
+            a_new, b_key, b_new = self.decrypt_layer_payload(
+                layers[a_key], round_id
+            )
+            output[a_key] = a_new
+            output[b_key] = b_new
         return output
+
+    def replay_download_size(
+        self,
+        state_dict: dict[str, torch.Tensor],
+        round_id: int = 1,
+    ) -> dict[str, int]:
+        """按真实分块和序列化格式快速重放单客户端下载 payload 大小。"""
+        states = self._validate_plaintexts(
+            [(client_id, state_dict) for client_id in range(self.num_clients)]
+        )
+        total_size = 0
+        encrypted_blocks = 0
+        plaintext_blocks = 0
+        layer_count = 0
+        for a_key in sorted(key for key in states[0] if "lora_A" in key):
+            b_key = a_key.replace("lora_A", "lora_B", 1)
+            a_tensor = states[0][a_key]
+            b_tensor = states[0][b_key]
+            self._validate_pair(a_key, a_tensor, b_key, b_tensor)
+            out_features = b_tensor.shape[0]
+            in_features = a_tensor.shape[1]
+            rows, cols = self._skeleton_indices(out_features, in_features)
+            partition = build_partition(
+                out_features, in_features, self.config.mode, self.config.ratio
+            )
+            blocks = build_blocks(
+                out_features,
+                in_features,
+                partition,
+                self.config.skeleton,
+                skeleton_rows=rows,
+                skeleton_cols=cols,
+                max_slots=self.config.poly_modulus_degree // 2,
+            )
+            aggregate_blocks = []
+            b_array = b_tensor.detach().cpu().numpy()
+            a_array = a_tensor.detach().cpu().numpy()
+            for block in blocks:
+                representative_upload = next(
+                    iter_block_uploads(
+                        b_array,
+                        a_array,
+                        self.public_context,
+                        self.rank,
+                        block,
+                    )
+                )
+                accumulated = accumulate_block(
+                    None, representative_upload, self.public_context
+                )
+                aggregate_blocks.append(
+                    finalize_block(accumulated, block, self.num_clients)
+                )
+                encrypted_blocks += int(block.encrypted)
+                plaintext_blocks += int(not block.encrypted)
+            layer_payload = {
+                "protocol": self.protocol,
+                "round_id": round_id,
+                "a_key": a_key,
+                "b_key": b_key,
+                "a_dtype": str(a_array.dtype),
+                "b_dtype": str(b_array.dtype),
+                "skeleton_rows": rows.tolist(),
+                "skeleton_cols": cols.tolist(),
+                "aggregate_result": {
+                    "shape": (out_features, in_features),
+                    "blocks": aggregate_blocks,
+                },
+            }
+            total_size += _upload_size(layer_payload)
+            layer_count += 1
+        return {
+            "download_size": total_size,
+            "layer_count": layer_count,
+            "encrypted_blocks": encrypted_blocks,
+            "plaintext_blocks": plaintext_blocks,
+        }
+
+    def secure_aggregate(
+        self,
+        ciphertexts: list[tuple[int, dict]],
+        round_id: int,
+    ) -> dict[str, torch.Tensor]:
+        """执行非流式协议往返并返回客户端恢复的 LoRA tensors。"""
+        payload = self.aggregate_encrypted(ciphertexts, round_id)
+        return self.decrypt_aggregate(payload, round_id)
 
     def secure_aggregate_streaming(
         self,
         plaintexts: list[tuple[int, dict[str, torch.Tensor]]],
         round_id: int,
         progress: Callable[[dict[str, Any]], None] | None = None,
+        decrypt_layer_fn: Callable[[dict[str, Any], int], Any] | None = None,
     ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
-        """使用独立进程并行聚合各层，并限制进程总内存。"""
+        """流式模拟客户端上传、公钥聚合和客户端解密，并限制总内存。"""
         ordered_plaintexts = sorted(plaintexts, key=lambda item: item[0])
         states = self._validate_plaintexts(ordered_plaintexts)
         layer_keys = sorted(key for key in states[0] if "lora_A" in key)
@@ -180,6 +303,9 @@ class SkeletonLoRACrypto:
             for client_id, _ in ordered_plaintexts
         }
         output: dict[str, torch.Tensor] = {}
+        decrypt_layer = decrypt_layer_fn or self.decrypt_layer_payload
+        download_size = 0
+        decrypt_time = 0.0
         observed_peak = _aggregate_memory_bytes()
         memory_limit = self._effective_memory_limit()
         admission_limit = int(memory_limit * 0.9)
@@ -203,11 +329,11 @@ class SkeletonLoRACrypto:
             "skeleton": self.config.skeleton,
             "skeleton_rank": self.config.skeleton_rank,
             "poly_modulus_degree": self.config.poly_modulus_degree,
-            "cur_condition_threshold": self.config.cur_condition_threshold,
             "progress_interval_blocks": self.config.progress_interval_blocks,
+            "protocol": self.protocol,
+            "round_id": round_id,
         }
         public_context = self.public_context.serialize()
-        secret_context = self.secret_context.serialize(save_secret_key=True)
         self._emit(
             progress,
             event="parallel_start",
@@ -236,7 +362,6 @@ class SkeletonLoRACrypto:
                 self.rank,
                 self.num_clients,
                 public_context,
-                secret_context,
                 progress_queue,
                 memory_limit,
             ),
@@ -302,13 +427,15 @@ class SkeletonLoRACrypto:
                     layer_futures.pop(future)
                     result = future.result()
                     a_key = result["a_key"]
-                    b_key = result["b_key"]
-                    output[a_key] = torch.from_numpy(result["a_new"]).to(
-                        dtype=states[0][a_key].dtype
+                    layer_payload = result["layer_payload"]
+                    decrypt_started = time.perf_counter()
+                    a_new, b_key, b_new = decrypt_layer(
+                        layer_payload, round_id
                     )
-                    output[b_key] = torch.from_numpy(result["b_new"]).to(
-                        dtype=states[0][b_key].dtype
-                    )
+                    decrypt_time += time.perf_counter() - decrypt_started
+                    output[a_key] = a_new.to(dtype=states[0][a_key].dtype)
+                    output[b_key] = b_new.to(dtype=states[0][b_key].dtype)
+                    download_size += result["download_size"]
                     for client_id, values in result["client_stats"].items():
                         client_id = int(client_id)
                         client_stats[client_id]["encrypt_time"] += values["encrypt_time"]
@@ -340,6 +467,8 @@ class SkeletonLoRACrypto:
         return output, {
             "strategy": self.config.memory_strategy,
             "clients": client_stats,
+            "download_size": download_size,
+            "decrypt_time": decrypt_time,
             "peak_rss_bytes": observed_peak,
             "parallel": {
                 "backend": "process",
@@ -356,7 +485,39 @@ class SkeletonLoRACrypto:
             },
         }
 
+    def decrypt_layer_payload(
+        self,
+        layer_payload: dict[str, Any],
+        round_id: int,
+    ) -> tuple[torch.Tensor, str, torch.Tensor]:
+        if layer_payload.get("protocol") != self.protocol:
+            raise ValueError("聚合层 payload 的协议不匹配")
+        if layer_payload.get("round_id") != round_id:
+            raise ValueError("聚合层 payload 的轮次不匹配")
+        a_key = layer_payload.get("a_key")
+        b_key = layer_payload.get("b_key")
+        if not isinstance(a_key, str) or not isinstance(b_key, str):
+            raise ValueError("聚合层 payload 缺少 LoRA A/B 键")
+        aggregate_result = layer_payload.get("aggregate_result")
+        if not isinstance(aggregate_result, dict):
+            raise ValueError("聚合层 payload 缺少聚合结果")
+        product, _ = decrypt_result(aggregate_result, self.secret_context)
+        if self.config.skeleton:
+            product = self._reconstruct_product(a_key, product, layer_payload)
+        product_tensor = torch.from_numpy(np.asarray(product, dtype=np.float32))
+        b_new, a_new = factorize_lora_product(product_tensor, self.rank)
+        return (
+            a_new.to(dtype=_torch_dtype(layer_payload.get("a_dtype"))),
+            b_key,
+            b_new.to(dtype=_torch_dtype(layer_payload.get("b_dtype"))),
+        )
+
     def _block_reserve_bytes(self, block) -> int:
+        result_bytes = self._block_result_reserve_bytes(block)
+        # 同时容纳各客户端上传和一份聚合结果。
+        return result_bytes * (self.num_clients + 1)
+
+    def _block_result_reserve_bytes(self, block) -> int:
         elements = block.row_indices.size * block.col_indices.size
         if block.encrypted:
             coefficient_bits = sum(self.config.coeff_mod_bit_sizes)
@@ -364,11 +525,8 @@ class SkeletonLoRACrypto:
             ciphertext_bytes = (
                 self.config.poly_modulus_degree * coefficient_bits * 4 // 8
             )
-            result_bytes = max(elements * 16, ciphertext_bytes)
-        else:
-            result_bytes = max(1, elements * 16)
-        # 预留每个客户端的序列化结果和一份块级聚合结果。
-        return result_bytes * (self.num_clients + 1)
+            return max(elements * 16, ciphertext_bytes)
+        return max(1, elements * 16)
 
     @staticmethod
     def _reconstruction_reserve_bytes(
@@ -554,11 +712,9 @@ class SkeletonLoRACrypto:
                 skeleton_cols=cols,
                 max_slots=self.config.poly_modulus_degree // 2,
             )
-            layer_buffer_bytes = (
-                out_features * cols.size + rows.size * in_features
-                if self.config.skeleton
-                else out_features * in_features
-            ) * np.dtype(np.float32).itemsize
+            layer_buffer_bytes = sum(
+                self._block_result_reserve_bytes(block) for block in blocks
+            )
             reconstruction_reserve = (
                 self._reconstruction_reserve_bytes(
                     out_features, in_features, rows.size, cols.size
@@ -676,6 +832,16 @@ def _upload_size(upload: dict[str, Any]) -> int:
     counter = _ByteCounter()
     pickle.Pickler(counter).dump(upload)
     return counter.size
+
+
+def _torch_dtype(value: Any) -> torch.dtype:
+    if not isinstance(value, str) or not value:
+        raise ValueError("聚合层 payload 的 dtype 无效")
+    name = value.rsplit(".", 1)[-1]
+    dtype = getattr(torch, name, None)
+    if not isinstance(dtype, torch.dtype):
+        raise ValueError(f"聚合层 payload 的 dtype 不受支持: {value}")
+    return dtype
 
 
 class _ByteCounter:

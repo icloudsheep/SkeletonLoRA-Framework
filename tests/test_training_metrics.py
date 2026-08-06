@@ -8,7 +8,7 @@ import unittest
 import torch
 
 from training_progress import _perplexity, _supervised_token_count
-from utils.metrics import CLIENT_ROUND_COLS, STEP_COLS, CsvWriters
+from utils.metrics import CLIENT_ROUND_COLS, ROUND_COLS, STEP_COLS, CsvWriters
 
 
 class TrainingMetricsTest(unittest.TestCase):
@@ -28,9 +28,13 @@ class TrainingMetricsTest(unittest.TestCase):
 
             step_header = (metrics_dir / "step.csv").read_text().splitlines()[0]
             round_header = (metrics_dir / "client_round.csv").read_text().splitlines()[0]
+            protocol_header = (metrics_dir / "round.csv").read_text().splitlines()[0]
 
         self.assertEqual(step_header.split(","), STEP_COLS)
         self.assertEqual(round_header.split(","), CLIENT_ROUND_COLS)
+        self.assertEqual(protocol_header.split(","), ROUND_COLS)
+        self.assertIn("download_size", ROUND_COLS)
+        self.assertIn("adapter_size", ROUND_COLS)
 
 
 if __name__ == "__main__":

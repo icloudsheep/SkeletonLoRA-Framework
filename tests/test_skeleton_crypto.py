@@ -1,3 +1,4 @@
+import inspect
 import os
 import pickle
 import unittest
@@ -10,6 +11,7 @@ from skeleton_crypto import SkeletonLoRACrypto
 from skeleton_crypto.bridge import _cpu_resources, _upload_size
 from skeleton_crypto.fe_modes import build_partition
 from skeleton_crypto.fe_outer_hybrid import Block, build_blocks
+from skeleton_crypto.process_worker import initialize_process_worker
 
 
 def _config(
@@ -165,7 +167,12 @@ class SkeletonCryptoTest(unittest.TestCase):
                     (client_id, crypto.encrypt(state, client_id, round_id=1))
                     for client_id, state in enumerate(states)
                 ]
-                aggregated = crypto.secure_aggregate(ciphertexts, round_id=1)
+                aggregate_payload = crypto.aggregate_encrypted(
+                    ciphertexts, round_id=1
+                )
+                aggregated = crypto.decrypt_aggregate(
+                    aggregate_payload, round_id=1
+                )
 
                 actual = (
                     aggregated["layer.lora_B.weight"]
@@ -221,6 +228,8 @@ class SkeletonCryptoTest(unittest.TestCase):
 
                 self.assertEqual(set(streaming), set(one_shot))
                 self.assertEqual(stats["strategy"], "layer_block_stream")
+                self.assertGreater(stats["download_size"], 0)
+                self.assertGreaterEqual(stats["decrypt_time"], 0)
                 self.assertEqual(events[0]["event"], "parallel_start")
                 self.assertTrue(
                     any(event["event"] == "layer_prepare_start" for event in events)
@@ -265,6 +274,28 @@ class SkeletonCryptoTest(unittest.TestCase):
                     actual = (streaming[b_key] @ streaming[a_key]).numpy()
                     expected = (one_shot[b_key] @ one_shot[a_key]).numpy()
                     np.testing.assert_allclose(actual, expected, rtol=3e-3, atol=3e-3)
+
+    def test_streaming_worker_does_not_accept_secret_context(self) -> None:
+        parameters = inspect.signature(initialize_process_worker).parameters
+
+        self.assertNotIn("secret_context", parameters)
+
+    def test_plain_replay_matches_streaming_download_size(self) -> None:
+        states = [_state(), _state()]
+        crypto = SkeletonLoRACrypto(
+            _config(skeleton=False, mode="partial_AB", ratio=0),
+            num_clients=2,
+            rank=2,
+        )
+
+        _, stats = crypto.secure_aggregate_streaming(
+            list(enumerate(states)), round_id=1
+        )
+        replay = crypto.replay_download_size(states[0], round_id=1)
+
+        self.assertEqual(stats["download_size"], replay["download_size"])
+        self.assertEqual(0, replay["encrypted_blocks"])
+        self.assertGreater(replay["plaintext_blocks"], 0)
 
     def test_streaming_dispatches_layers_to_multiple_processes(self) -> None:
         states = []

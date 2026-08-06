@@ -8,7 +8,7 @@
 
 ## 项目目标
 
-框架用于单机模拟多客户端联邦 LoRA 微调：只加载一份基座模型，为每个客户端注册独立 adapter；客户端完成本地训练后上传 LoRA 状态，服务端执行解密与聚合，再把聚合结果广播给下一轮的所有客户端。
+框架用于单机模拟多客户端联邦 LoRA 微调：只加载一份基座模型，为每个客户端注册独立 adapter；客户端完成本地训练后上传 LoRA payload，服务端只使用公钥聚合，客户端解密聚合 payload 后形成下一轮 adapter。
 
 `main.py` 显式保留联邦流程和加解密钩子。数据编码、训练指标、checkpoint、模型构建和评测分别由独立模块承担。
 
@@ -52,7 +52,7 @@ SkeletonLoRA-Framework/
 ├── evaluate.sh                   评估环境检查与参数转发
 ├── download.sh                   模型、训练集和测试集下载入口
 ├── client/                       客户端加密薄壳
-├── server/                       服务端解密/聚合薄壳
+├── server/                       不持有解密密钥的服务端聚合薄壳
 ├── runtime/
 │   ├── device.py                 device 选择与随机种子
 │   ├── paths.py                  run_id 和输出目录
@@ -81,7 +81,7 @@ global_state
   -> client_0 本地训练 -> 加密
   -> client_1 本地训练 -> 加密
   -> ...
-  -> server.decrypt_aggregate
+  -> server public-key aggregate -> client decrypt/reconstruct/SVD
   -> save_round_checkpoint
   -> global_state = aggregated
 ```
@@ -100,32 +100,37 @@ global_state
 
 ## 加解密与聚合边界
 
-业务钩子位于 `main.py` 顶部：
+CKKS 协议分为三个明确阶段：
 
 ```python
-encrypt_fn = lambda state_dict, client_id, round_id: state_dict
-decrypt_fn = lambda ciphertext, client_id, round_id: ciphertext
-aggregate_fn = lambda plaintexts, rank: aggregate_lora_products(plaintexts, rank=rank)
-secure_aggregate_fn = None
+client_upload = crypto.encrypt(state_dict, client_id, round_id)
+aggregate_payload = crypto.aggregate_encrypted(ciphertexts, round_id)
+global_state = crypto.decrypt_aggregate(aggregate_payload, round_id)
 ```
+
+流式训练采用相同的线格式逐层处理。聚合 worker 只初始化 public CKKS
+context，输出尚未解密的聚合 payload；客户端侧随后解密、执行 Skeleton CUR
+重构并用 SVD 恢复 LoRA A/B。
+
+这是单机协议仿真，不提供客户端与服务端的 OS 级隔离。为避免巨型中间 payload
+常驻内存，同一协议 worker 依次生成客户端上传并立即交给公钥聚合阶段；服务端
+接口只接受生成后的 payload，私钥不会进入该 worker。
 
 接口含义：
 
 | 钩子 | 输入 | 输出 |
 |---|---|---|
-| `encrypt_fn` | adapter state、client id、round id | 任意可传递的密文对象 |
-| `decrypt_fn` | 密文对象、client id、round id | 可聚合的 adapter state |
-| `aggregate_fn` | 全部客户端明文 state、目标 rank | 聚合后的 adapter state |
-| `secure_aggregate_fn` | `(client_id, ciphertext)` 列表、round id | 聚合后的 adapter state |
-
-`secure_aggregate_fn is None` 时，`Server` 逐客户端调用 `decrypt_fn`，再调用明文 `aggregate_fn`。设置密文聚合函数后，服务端不走逐客户端解密路径。
+| `encrypt` | adapter state、client id、round id | 客户端上传 payload |
+| `aggregate_encrypted` | `(client_id, payload)` 列表、round id | 未解密的聚合 payload |
+| `decrypt_aggregate` | 聚合 payload、round id | 重构并分解后的 adapter state |
+| `secure_aggregate_streaming` | 全部客户端 state、round id | adapter state 与协议统计 |
 
 约束：
 
-- 加密和解密的对象结构必须严格配对，框架不会推断密文格式。
-- 解密或密文聚合返回的 key、shape 和 dtype 必须能写回 PEFT adapter。
+- 上传和聚合 payload 的协议、round、key、shape 和 dtype 必须严格匹配。
+- 服务端聚合进程不得接收 secret CKKS context。
 - `client_id` 和 `round_id` 可用于密钥选择、AAD 或轮次隔离。
-- `sizeof` 使用 pickle 序列化后的字节数作为明文、密文和下发大小的统一度量口径。
+- 上传和下载均使用 pickle 线格式的实际字节数；下载统计点位于聚合完成后、客户端解密前。
 - 加密计时只覆盖 `client.encrypt(...)`；训练时间和服务端聚合时间分别统计。
 - 引入有损近似、量化或同态加密时，应单独验证解密误差、聚合误差和最终 checkpoint 可加载性。
 
@@ -227,7 +232,7 @@ bash download.sh [TARGET ...]
 
 ### 其他 CSV
 
-- `round.csv`：每轮每客户端的 `encrypt_time`、`plaintext_size`、`ciphertext_size`，以及本轮共享的 `aggregate_time`、`broadcast_size`。
+- `round.csv`：每轮每客户端的 `encrypt_time`、`plaintext_size`、`ciphertext_size`，以及本轮共享的 `aggregate_time`、`decrypt_time`、`download_size`、`broadcast_size` 和 `adapter_size`。`broadcast_size` 是 `download_size` 的兼容别名，`adapter_size` 是解密和 SVD 后的明文 LoRA 大小。
 - `grad_norm.csv`：每层 LoRA 参数的逐 step 梯度范数长表。
 
 学术对比收敛速度时，应优先使用相同 token 预算下的 `token_weighted_mean_loss` 或 `final_moving_avg_loss`，同时报告数据集、有效监督 token、客户端数、round、local steps、batch size、学习率和 seed。不同任务的绝对 loss 不可直接比较。

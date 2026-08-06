@@ -1,4 +1,4 @@
-"""在独立进程中执行单层 CKKS 聚合。"""
+"""在独立进程中执行单层客户端上传与公钥聚合协议。"""
 
 from __future__ import annotations
 
@@ -17,14 +17,9 @@ from skeleton_crypto.fe_modes import build_partition
 from skeleton_crypto.fe_outer_hybrid import (
     accumulate_block,
     build_blocks,
-    decrypt_block,
     finalize_block,
 )
-from skeleton_crypto.fe_skeleton import (
-    cur_reconstruct_with_stats,
-    select_uniform_rect_indices,
-)
-from utils import factorize_lora_product
+from skeleton_crypto.fe_skeleton import select_uniform_rect_indices
 
 
 _RUNTIME: dict[str, Any] = {}
@@ -36,11 +31,10 @@ def initialize_process_worker(
     rank: int,
     num_clients: int,
     public_context: bytes,
-    secret_context: bytes,
     progress_queue,
     memory_limit_bytes: int,
 ) -> None:
-    """初始化进程私有的模型状态和 CKKS context。"""
+    """初始化只含公钥 CKKS context 的协议仿真进程。"""
     torch.set_num_threads(1)
     _RUNTIME.update(
         states=states,
@@ -48,7 +42,6 @@ def initialize_process_worker(
         rank=rank,
         num_clients=num_clients,
         public_context=ts.context_from(public_context),
-        secret_context=ts.context_from(secret_context),
         progress_queue=progress_queue,
         memory_limit_bytes=memory_limit_bytes,
         peak_memory_bytes=_aggregate_memory_bytes(),
@@ -56,7 +49,7 @@ def initialize_process_worker(
 
 
 def aggregate_layer_process(task: tuple[int, int, str]) -> dict[str, Any]:
-    """完成一层的分块加密、聚合、解密和低秩分解。"""
+    """依次生成客户端上传并执行公钥聚合，返回序列化下发 payload。"""
     layer_wall_started = time.perf_counter()
     layer_cpu_started = time.process_time()
     layer_index, layer_count, a_key = task
@@ -113,21 +106,11 @@ def aggregate_layer_process(task: tuple[int, int, str]) -> dict[str, Any]:
         worker_cpu_utilization=0.0,
     )
 
-    if config["skeleton"]:
-        product = None
-        cross_columns = np.zeros((out_features, cols.size), dtype=np.float32)
-        cross_rows = np.zeros((rows.size, in_features), dtype=np.float32)
-        row_positions = {int(value): index for index, value in enumerate(rows)}
-        col_positions = {int(value): index for index, value in enumerate(cols)}
-    else:
-        product = np.zeros((out_features, in_features), dtype=np.float32)
-        cross_columns = cross_rows = None
-        row_positions = col_positions = {}
-
     client_stats = {
         client_id: {"encrypt_time": 0.0, "ciphertext_size": 0}
         for client_id in range(_RUNTIME["num_clients"])
     }
+    aggregate_blocks = []
     for block_index, block in enumerate(blocks, start=1):
         _ensure_memory_limit()
         accumulated = None
@@ -147,19 +130,7 @@ def aggregate_layer_process(task: tuple[int, int, str]) -> dict[str, Any]:
                     accumulated, upload, _RUNTIME["public_context"]
                 )
         block_result = finalize_block(accumulated, block, _RUNTIME["num_clients"])
-        values = decrypt_block(block_result, _RUNTIME["secret_context"])
-        block_matrix = values.reshape(
-            block.col_indices.size, block.row_indices.size
-        ).T
-        if product is not None:
-            product[np.ix_(block.row_indices, block.col_indices)] = block_matrix
-        else:
-            if block.cols_selected:
-                selected_cols = [col_positions[int(value)] for value in block.col_indices]
-                cross_columns[np.ix_(block.row_indices, selected_cols)] = block_matrix
-            if block.rows_selected:
-                selected_rows = [row_positions[int(value)] for value in block.row_indices]
-                cross_rows[np.ix_(selected_rows, block.col_indices)] = block_matrix
+        aggregate_blocks.append(block_result)
         if _should_report(block_index, len(blocks), config["progress_interval_blocks"]):
             layer_elapsed = time.perf_counter() - layer_wall_started
             worker_cpu_seconds = time.process_time() - layer_cpu_started
@@ -177,22 +148,20 @@ def aggregate_layer_process(task: tuple[int, int, str]) -> dict[str, Any]:
                 ),
             )
 
-    if product is None:
-        product, ok, reconstruction_stats = cur_reconstruct_with_stats(
-            cross_columns,
-            cross_rows,
-            rows,
-            cols,
-            condition_threshold=config["cur_condition_threshold"],
-        )
-        if not ok or product is None:
-            raise RuntimeError(
-                f"{a_key} 的 CUR 重建失败: "
-                f"{reconstruction_stats['failure_reason']}"
-            )
-
-    product_tensor = torch.from_numpy(np.asarray(product, dtype=np.float32))
-    b_new, a_new = factorize_lora_product(product_tensor, _RUNTIME["rank"])
+    layer_payload = {
+        "protocol": config["protocol"],
+        "round_id": config["round_id"],
+        "a_key": a_key,
+        "b_key": b_key,
+        "a_dtype": str(a_arrays[0].dtype),
+        "b_dtype": str(b_arrays[0].dtype),
+        "skeleton_rows": rows.tolist(),
+        "skeleton_cols": cols.tolist(),
+        "aggregate_result": {
+            "shape": (out_features, in_features),
+            "blocks": aggregate_blocks,
+        },
+    }
     layer_elapsed = time.perf_counter() - layer_wall_started
     worker_cpu_seconds = time.process_time() - layer_cpu_started
     _emit(
@@ -208,9 +177,8 @@ def aggregate_layer_process(task: tuple[int, int, str]) -> dict[str, Any]:
     )
     return {
         "a_key": a_key,
-        "b_key": b_key,
-        "a_new": a_new.numpy(),
-        "b_new": b_new.numpy(),
+        "layer_payload": layer_payload,
+        "download_size": _upload_size(layer_payload),
         "client_stats": client_stats,
         "peak_memory_bytes": _RUNTIME["peak_memory_bytes"],
     }

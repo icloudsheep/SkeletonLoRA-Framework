@@ -18,7 +18,6 @@ from runtime import (
     save_round_checkpoint,
     seed_all,
 )
-from server import Server
 from skeleton_crypto import SkeletonLoRACrypto
 from training_progress import train_client_one_round
 from utils import CsvWriters, TbWriters, build_logger, load_yaml, perf_timer, sizeof
@@ -36,10 +35,6 @@ def _default_encryption_config(num_clients: int, rank: int) -> dict:
         "global_scale": 2 ** 40,
         "cur_condition_threshold": 1e12,
     }
-
-
-def _plaintext_path_disabled(*_args, **_kwargs):
-    raise RuntimeError("CKKS 模式不允许回退到明文聚合路径")
 
 
 def main() -> None:
@@ -76,13 +71,14 @@ def main() -> None:
     logger.info("模型就绪: kind=%s num_adapters=%d", config["model"]["kind"], num_clients)
 
     shards = build_shards(config)
-    clients = [Client(client_id=i, encrypt_fn=crypto.encrypt) for i in range(num_clients)]
-    server = Server(
-        decrypt_fn=_plaintext_path_disabled,
-        aggregate_fn=_plaintext_path_disabled,
-        secure_aggregate_fn=crypto.secure_aggregate,
-        secure_stream_aggregate_fn=crypto.secure_aggregate_streaming,
-    )
+    clients = [
+        Client(
+            client_id=i,
+            encrypt_fn=crypto.encrypt,
+            decrypt_fn=crypto.decrypt_layer_payload,
+        )
+        for i in range(num_clients)
+    ]
 
     csv_w = CsvWriters(metrics_dir=paths.metrics_dir)
     tb_w = TbWriters(tb_dir=paths.tb_dir, num_clients=num_clients)
@@ -181,16 +177,22 @@ def main() -> None:
                 )
 
         with perf_timer() as t_agg:
-            aggregated, crypto_stats = server.stream_decrypt_aggregate(
-                plaintexts, rnd, progress=report_crypto_progress
+            aggregated, crypto_stats = crypto.secure_aggregate_streaming(
+                plaintexts,
+                rnd,
+                decrypt_layer_fn=clients[0].decrypt,
+                progress=report_crypto_progress,
             )
         aggregated = {k: v.detach().cpu() for k, v in aggregated.items()}
-        b_size = sizeof(aggregated)
+        adapter_size = sizeof(aggregated)
+        download_size = crypto_stats["download_size"]
         logger.info(
-            "round %d 聚合完成: strategy=%s 耗时=%.6fs 下发大小=%dB "
+            "round %d 聚合完成: strategy=%s 耗时=%.6fs 聚合payload下发=%dB "
+            "客户端解密=%.6fs 明文adapter=%dB "
             "peak_memory=%.2fGiB workers=%d/%d minimum_workers=%d "
             "peak_active=%d peak_inflight=%d worker_downgrades=%d memory_waits=%d",
-            rnd, crypto_stats["strategy"], t_agg.value, b_size,
+            rnd, crypto_stats["strategy"], t_agg.value, download_size,
+            crypto_stats["decrypt_time"], adapter_size,
             crypto_stats["peak_rss_bytes"] / 1024 ** 3,
             crypto_stats["parallel"]["effective_workers"],
             crypto_stats["parallel"]["requested_workers"],
@@ -201,7 +203,11 @@ def main() -> None:
             crypto_stats["parallel"]["memory_wait_count"],
         )
         tb_w.global_.add_scalar("aggregate_time", t_agg.value, global_step=rnd)
-        tb_w.global_.add_scalar("broadcast_size", b_size, global_step=rnd)
+        tb_w.global_.add_scalar("download_size", download_size, global_step=rnd)
+        tb_w.global_.add_scalar(
+            "decrypt_time", crypto_stats["decrypt_time"], global_step=rnd
+        )
+        tb_w.global_.add_scalar("adapter_size", adapter_size, global_step=rnd)
         tb_w.global_.add_scalar(
             "memory/peak_rss_gib",
             crypto_stats["peak_rss_bytes"] / 1024 ** 3,
@@ -212,7 +218,11 @@ def main() -> None:
             client_stats = crypto_stats["clients"][row["client_id"]]
             row["encrypt_time"] = client_stats["encrypt_time"]
             row["ciphertext_size"] = client_stats["ciphertext_size"]
-            row["aggregate_time"], row["broadcast_size"] = t_agg.value, b_size
+            row["aggregate_time"] = t_agg.value
+            row["decrypt_time"] = crypto_stats["decrypt_time"]
+            row["download_size"] = download_size
+            row["broadcast_size"] = download_size
+            row["adapter_size"] = adapter_size
             csv_w.round.write(row)
             client_tb = tb_w.client(row["client_id"])
             client_tb.add_scalar("encrypt_time", row["encrypt_time"], global_step=rnd)

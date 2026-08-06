@@ -4,7 +4,8 @@
   step.csv       -> 每步 loss、困惑度、梯度、学习率与耗时
   client_round.csv -> 每个客户端在一轮本地训练中的 loss 汇总
   round.csv      -> round, client_id, encrypt_time, plaintext_size,
-                    ciphertext_size, aggregate_time, broadcast_size
+                    ciphertext_size, aggregate_time, decrypt_time,
+                    download_size, broadcast_size, adapter_size
   grad_norm.csv  -> round, client_id, step, layer_name, grad_norm
 
 TensorBoard 按客户端拆子目录,方便在同一块 board 上对比各客户端曲线。
@@ -53,7 +54,10 @@ ROUND_COLS = [
     "plaintext_size",
     "ciphertext_size",
     "aggregate_time",
+    "decrypt_time",
+    "download_size",
     "broadcast_size",
+    "adapter_size",
 ]
 GRAD_NORM_COLS = ["round", "client_id", "step", "layer_name", "grad_norm"]
 

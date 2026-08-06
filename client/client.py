@@ -1,4 +1,4 @@
-"""客户端: 只持有身份,加密逻辑通过函数指针从 main 注入。"""
+"""客户端持有身份，以及协议注入的加密与聚合 payload 解密函数。"""
 
 from typing import Any, Callable, Dict
 
@@ -10,7 +10,9 @@ class Client:
         self,
         client_id: int,
         encrypt_fn: Callable[[Dict[str, torch.Tensor], int, int], Any],
+        decrypt_fn: Callable[[dict, int], Any],
     ) -> None:
         self.client_id = client_id
         self.adapter_name = f"client_{client_id}"
-        self.encrypt = encrypt_fn  # 直接挂为属性,由 main 在构造时传入
+        self.encrypt = encrypt_fn
+        self.decrypt = decrypt_fn

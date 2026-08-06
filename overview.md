@@ -11,11 +11,7 @@
 要求拥有至少以下文件夹：
 
 - client：存放客户端的相关代码，多客户端的实现依靠在 main.py 中创建多个实例实现，客户端每次上传完整的 A、B 两个矩阵。客户端**暴露加密函数 `encrypt`**（明文输入为 A、B 两个矩阵的内存张量字典 `Dict[str, torch.Tensor]`，返回为任意类型，后续由用户自行处理）。`encrypt` 的函数体给恒等占位（`return state_dict`），用户可覆盖为真加密。main 只按入参出参调用。
-- server：存放服务端的相关代码，服务端**暴露解密聚合二合一函数 `decrypt_aggregate`**（输入为多个客户端的任意格式加密信息，输出为处理完成后的 `Dict[str, torch.Tensor]`，可直接下发）。其内部固定流程为：
-  1. 对每份密文调用用户可覆盖的 `decrypt`（默认恒等占位 `return ciphertext`）
-  2. 对得到的多份明文张量字典调用用户可覆盖的 `aggregate`（默认对 `B @ A` 做等权平均后分解回 LoRA A/B）
-  3. 对聚合后的结果调用 `utils` 中的 SVD 工具做后处理
-  下行链路无需加密，直接作为下一轮客户端的训练起点。默认占位实现允许框架自身跑通端到端明文乘积聚合，用户接入真加密时覆盖对应函数即可。main 只按入参出参调用。
+- server：存放服务端的相关代码。服务端只接收客户端 payload，并使用公开 CKKS context 完成聚合；不持有客户端私钥，也不执行解密。聚合 payload 下发后，由客户端解密、按需完成 Skeleton CUR 重构，并通过 SVD 恢复下一轮 LoRA A/B。
 - models：存放所有需要的模型数据，要求使用本地模型权重而非现场下载。基座模型使用 `openlm-research/open_llama_3b_v2` 和 `openlm-research/open_llama_7b_v2`。
 - datasets：存放所有需要的数据集，要求使用本地数据集而非现场下载，数据集需要按照客户端平均划分。数据集名称和路径（String），以及其分类和数据集平分方法（枚举）均存于 configs 中。**分片结果在 main 启动时一次性构建并缓存在内存**（避免每轮/每客户端重复读盘），`build_dataloader(config, client_id) -> DataLoader` 只从缓存中取对应 client_id 的分片。
 - logs：**只存 Python logging 的文本日志**。按时间戳建子目录 `logs/<timestamp>/train.log`，与 output 物理隔离（人读的文本 vs 机器读的结构化产物）。
@@ -58,9 +54,9 @@
 - 要有完善的 log 工具，关键步骤打日志，记录数据。文本日志落 `logs/<timestamp>/train.log`。INFO 及以上同时输出到控制台，DEBUG 仅落文件。
 - 关键信息需要保存为 csv，全部落 `output/<timestamp>/metrics/`：
   - `step.csv`（粒度 step）：`round, client_id, step, loss`。`round` 从 1 起，`step` 为本轮内 0..K-1（全局累计可由 `round × K + step` 算出，不冗余存）。
-  - `round.csv`（粒度 round，客户端级 + 服务端级字段混在一张表；服务端级字段在同一 round 的 N 行里冗余写 N 次，方便 join）：`round, client_id, encrypt_time, plaintext_size, ciphertext_size, aggregate_time, broadcast_size`
+  - `round.csv`（粒度 round，客户端级 + 服务端级字段混在一张表；服务端级字段在同一 round 的 N 行里冗余写 N 次，方便 join）：`round, client_id, encrypt_time, plaintext_size, ciphertext_size, aggregate_time, decrypt_time, download_size, broadcast_size, adapter_size`
   - `grad_norm.csv`（长表，避免 step.csv 列数暴涨）：`round, client_id, step, layer_name, grad_norm`
-  - 说明：每层 LoRA adapter 参数的梯度范数走 `grad_norm.csv`，每 step 每层一行；聚合时间包含解密时间；空间大小含原文 bin、密文 bin、下发 bin。
+  - 说明：每层 LoRA adapter 参数的梯度范数走 `grad_norm.csv`，每 step 每层一行；`download_size` 在客户端解密前统计，`adapter_size` 是解密、重构和 SVD 后的明文 LoRA 大小。
 - 各种时间记录使用 `time.perf_counter()` 包住来记录，计时点在 main 中（client / server 为黑盒）。
 - 各种空间大小使用 utils 提供的 `sizeof(obj)`，内部统一用 `pickle.dumps(obj)` 后取长度（原文 / 密文 / 下发都走同一度量，可比性优先）。
 - 将上面的信息尽可能存入 tensorBoard（粒度分客户端，尽可能详细），在线实时查看。tensorboard 日志目录 = `output/<timestamp>/tensorboard/`。

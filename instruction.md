@@ -121,7 +121,37 @@ output/<run_id>/
 └── tensorboard/
 ```
 
-训练结束或脚本收到退出信号时，`run.sh` 会关闭由它启动的 TensorBoard。当前仓库的 `main.py` 提供加密、解密与安全聚合接口，但默认实现是明文恒等传递和等权聚合；仅运行现有基准配置不代表启用了 CKKS。
+训练结束或脚本收到退出信号时，`run.sh` 会关闭由它启动的 TensorBoard。当前仓库的 `main.py` 按配置中的 `encryption` 段执行 CKKS 上传、公钥聚合和客户端解密；聚合仍采用客户端等权平均。
+
+## 修复历史下载流量
+
+历史 `round.csv` 的 `broadcast_size` 记录的是解密和 SVD 后的明文 adapter，
+不能作为 CKKS 聚合 payload 的下载量。已有 final adapter 时可以跳过训练，按配置中的
+真实 tensor 形状、CKKS 参数和分块规则快速重放下载线格式：
+
+```shell
+bash repair_download_metrics.sh configs/ckks-AB-1.yaml 3B-AB-01-MMLU
+```
+
+默认模式只对每个块执行一次决定密文层级和序列化大小的代表性运算。需要完整复制为
+`K` 个客户端并执行全部同态乘法与聚合时，增加 `--exact`：
+
+```shell
+bash repair_download_metrics.sh \
+  configs/ckks-AB-1.yaml \
+  3B-AB-01-MMLU \
+  --exact
+```
+
+结果写入：
+
+```text
+output/<run-id>/metrics/download_traffic_replay.csv
+```
+
+CSV 同时给出每客户端上传和下载的 bytes/MiB，以及按配置中的客户端数和轮数计算的
+整次运行 GiB。换算使用二进制单位：`1 MiB = 2^20 bytes`，
+`1 GiB = 2^30 bytes`。原 `round.csv` 不会被修改。
 
 ## evaluate.sh 的使用案例
 

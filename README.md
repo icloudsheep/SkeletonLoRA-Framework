@@ -5,7 +5,7 @@
 ## 核心能力
 
 - 多客户端共享基座权重，降低单机联邦实验的显存开销。
-- 加密、解密、明文聚合和密文聚合通过 `main.py` 中的函数钩子接入。
+- CKKS 客户端上传、服务端公钥聚合和客户端解密采用独立协议阶段。
 - 支持 OpenLLaMA 3B/7B v2、本地训练数据和离线评测。
 - 支持 Dolly 15k、MMLU auxiliary train、Super-NaturalInstructions 和 dummy 冒烟数据。
 - 记录逐步 loss、移动平均 loss、困惑度、监督 token、梯度范数、吞吐量、训练耗时和通信开销。
@@ -90,7 +90,8 @@ python main.py --config configs/<task>.yaml
 上一轮聚合权重广播（首轮跳过）
   -> 各客户端依次本地训练
   -> 客户端加密上传
-  -> 服务端解密并聚合，或直接密文聚合
+  -> 服务端使用公钥聚合并下发 payload
+  -> 客户端解密、Skeleton 重构和 SVD
   -> 保存 round checkpoint
 ```
 
@@ -128,7 +129,7 @@ output/<run_id>/
 
 - `step.csv`：逐 step loss、移动平均、困惑度、监督 token、全局梯度范数、学习率、耗时和吞吐量。
 - `client_round.csv`：每个客户端每轮的普通平均 loss、token 加权平均 loss、最小/最大/最终 loss、最终移动平均和训练耗时。
-- `round.csv`：加密耗时、明文大小、密文大小、聚合耗时和下发大小。
+- `round.csv`：加密/聚合/解密耗时、上传 payload、聚合 payload 下载量，以及解密后的 adapter 大小。
 - `grad_norm.csv`：每个 LoRA 参数张量的逐 step 梯度范数。
 
 `A.safetensors` 和 `B.safetensors` 分别保存聚合后的 LoRA A/B；`adapter_model.safetensors` 保存可直接加载的完整 adapter 状态；`final` 指向最后一轮 checkpoint。
@@ -156,23 +157,22 @@ bash evaluate.sh configs/<task>.yaml <run_id> gsm8k base
 
 ## 加解密接口
 
-`main.py` 顶部定义四个业务钩子：
+CKKS 聚合接口按信任边界拆分：
 
 ```python
-encrypt_fn(state_dict, client_id, round_id) -> ciphertext
-decrypt_fn(ciphertext, client_id, round_id) -> state_dict
-aggregate_fn(plaintexts, rank) -> state_dict
-secure_aggregate_fn(ciphertexts, round_id) -> state_dict
+encrypt(state_dict, client_id, round_id) -> client_payload
+aggregate_encrypted(ciphertexts, round_id) -> aggregate_payload
+decrypt_aggregate(aggregate_payload, round_id) -> state_dict
 ```
 
-`secure_aggregate_fn` 为 `None` 时，服务端逐客户端解密后调用 `aggregate_fn`；否则直接把全部 `(client_id, ciphertext)` 交给密文聚合函数。具体约束和扩展方法见 [CLAUDE.md](./CLAUDE.md)。
+服务端聚合阶段只使用 public CKKS context。聚合 payload 在下发大小完成统计后，才由客户端侧解密、重构和 SVD。历史实验的下载量可用 `repair_download_metrics.sh` 从 final adapter 免训练重放。具体约束见 [CLAUDE.md](./CLAUDE.md)。
 
 ## 验证
 
 ```bash
 conda run -n skeleton_lora_fe python -m unittest discover -s tests -v
 conda run -n skeleton_lora_fe ruff check .
-bash -n download.sh run.sh evaluate.sh
+bash -n download.sh run.sh evaluate.sh repair_download_metrics.sh
 ```
 
 ## 文档
