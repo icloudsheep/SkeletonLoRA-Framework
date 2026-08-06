@@ -1,10 +1,8 @@
-# SecLoRA SEL-2S end-to-end run. Paths and training settings match default.yaml.
-
 seed: 42
 
 federated:
-  num_clients: 4
-  num_rounds: 3
+  num_clients: 2
+  num_rounds: 20
   local_steps: 300
 
 lora:
@@ -13,11 +11,13 @@ lora:
   target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
 
 train:
-  batch_size: 4
+  batch_size: 2
   learning_rate: 2.0e-4
   optimizer: adamw
   weight_decay: 0.0
   dtype: float32
+  loss_moving_average_window: 20
+  loss_moving_average_across_rounds: false
 
 model:
   kind: open_llama
@@ -26,15 +26,16 @@ model:
   dtype: float32
 
 dataset:
-  kind: mmlu_train
+  kind: natural_instructions
   split_method: iid_uniform
-  path: ./datasets/mmlu/mmlu_auxiliary_train.jsonl
-  max_length: 512
+  path: ./datasets/natural-instructions
+  max_length: 1024
+  max_samples: 20000
 
 secure_aggregation:
   backend: seclora
   mode: sel-2s
-  ratio: 0.10  # Formal runs: set manually to 0.01, 0.10, or 0.25.
+  ratio: 0.01
   sfp: 22
   xmax: 0.03125
   threads: 25

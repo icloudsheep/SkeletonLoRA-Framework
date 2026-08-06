@@ -1,3 +1,4 @@
+#include <chrono>
 #include <memory>
 #include <stdexcept>
 #include <vector>
@@ -61,7 +62,7 @@ py::array_t<long long> matrix_array(
 }  // namespace
 
 PYBIND11_MODULE(_seclora_native, module) {
-    module.doc() = "Persistent PC-DMCFE SEL-2S backend for SkeletonLoRA";
+    module.doc() = "Persistent PC-DMCFE SecLoRA backend for SkeletonLoRA";
 
     py::class_<NativeClientUpdate, std::shared_ptr<NativeClientUpdate>>(
         module, "NativeClientUpdate")
@@ -76,7 +77,24 @@ PYBIND11_MODULE(_seclora_native, module) {
         .def_property_readonly(
             "serialized_size_bytes", [](const NativeClientUpdate& value) {
                 return value.serialized_size_bytes;
-            });
+            })
+        .def_readonly("sp_plain_bytes", &NativeClientUpdate::sp_plain_bytes)
+        .def_readonly("sd_cipher_bytes", &NativeClientUpdate::sd_cipher_bytes)
+        .def_readonly("protected_b_labels", &NativeClientUpdate::protected_b_labels)
+        .def_readonly("protected_a_labels", &NativeClientUpdate::protected_a_labels)
+        .def_readonly("candidate_b_labels", &NativeClientUpdate::candidate_b_labels)
+        .def_readonly("candidate_a_labels", &NativeClientUpdate::candidate_a_labels)
+        .def_readonly(
+            "quantize_pack_wall_sec",
+            &NativeClientUpdate::quantize_pack_wall_sec)
+        .def_readonly(
+            "binding_input_copy_wall_sec",
+            &NativeClientUpdate::binding_input_copy_wall_sec)
+        .def_readonly("precompute_wall_sec", &NativeClientUpdate::precompute_wall_sec)
+        .def_readonly(
+            "online_crypto_wall_sec",
+            &NativeClientUpdate::online_crypto_wall_sec)
+        .def_readonly("serialize_wall_sec", &NativeClientUpdate::serialize_wall_sec);
 
     py::class_<NativeLayerSkeleton>(module, "NativeLayerSkeleton")
         .def_property_readonly(
@@ -99,41 +117,112 @@ PYBIND11_MODULE(_seclora_native, module) {
             })
         .def_readonly(
             "selected_rank", &NativeLayerSkeleton::selected_rank)
+        .def_readonly("pivot_rows", &NativeLayerSkeleton::pivot_rows)
+        .def_readonly("pivot_cols", &NativeLayerSkeleton::pivot_cols)
         .def_readonly(
             "baseline_checks", &NativeLayerSkeleton::baseline_checks)
         .def_readonly(
             "baseline_relative_error",
             &NativeLayerSkeleton::baseline_relative_error)
         .def_readonly(
-            "decrypted_cells", &NativeLayerSkeleton::decrypted_cells);
+            "decrypted_cells", &NativeLayerSkeleton::decrypted_cells)
+        .def_readonly(
+            "pivot_candidate_cells",
+            &NativeLayerSkeleton::pivot_candidate_cells)
+        .def_readonly(
+            "download_c_bytes", &NativeLayerSkeleton::download_c_bytes)
+        .def_readonly(
+            "download_m_bytes", &NativeLayerSkeleton::download_m_bytes)
+        .def_readonly(
+            "download_s_bytes", &NativeLayerSkeleton::download_s_bytes);
+
+    py::class_<NativeRoundMetrics>(module, "NativeRoundMetrics")
+        .def_readonly("mode", &NativeRoundMetrics::mode)
+        .def_readonly("sp_wall_sec", &NativeRoundMetrics::sp_wall_sec)
+        .def_readonly("sd_wall_sec", &NativeRoundMetrics::sd_wall_sec)
+        .def_readonly(
+            "sd_dfe_mask_wall_sec",
+            &NativeRoundMetrics::sd_dfe_mask_wall_sec)
+        .def_readonly(
+            "sd_fe_eval_wall_sec",
+            &NativeRoundMetrics::sd_fe_eval_wall_sec)
+        .def_readonly(
+            "sd_bsgs_search_wall_sec",
+            &NativeRoundMetrics::sd_bsgs_search_wall_sec)
+        .def_readonly(
+            "sd_control_wall_sec",
+            &NativeRoundMetrics::sd_control_wall_sec)
+        .def_readonly(
+            "cur_skeleton_wall_sec",
+            &NativeRoundMetrics::cur_skeleton_wall_sec)
+        .def_readonly(
+            "cur_reconstruct_wall_sec",
+            &NativeRoundMetrics::cur_reconstruct_wall_sec)
+        .def_readonly(
+            "experiment_verify_wall_sec",
+            &NativeRoundMetrics::experiment_verify_wall_sec)
+        .def_readonly(
+            "server_common_control_wall_sec",
+            &NativeRoundMetrics::server_common_control_wall_sec)
+        .def_readonly(
+            "observed_serial_server_wall_sec",
+            &NativeRoundMetrics::observed_serial_server_wall_sec)
+        .def_readonly(
+            "protected_skeleton_cells",
+            &NativeRoundMetrics::protected_skeleton_cells)
+        .def_readonly(
+            "pivot_candidate_cells",
+            &NativeRoundMetrics::pivot_candidate_cells)
+        .def_readonly(
+            "download_c_bytes_per_client",
+            &NativeRoundMetrics::download_c_bytes_per_client)
+        .def_readonly(
+            "download_m_bytes_per_client",
+            &NativeRoundMetrics::download_m_bytes_per_client)
+        .def_readonly(
+            "download_s_bytes_per_client",
+            &NativeRoundMetrics::download_s_bytes_per_client)
+        .def_readonly(
+            "download_bytes_per_client",
+            &NativeRoundMetrics::download_bytes_per_client);
 
     py::class_<SelectiveTwoServerSession>(
         module, "SelectiveTwoServerSession")
         .def(
             py::init([](int num_clients, int rank, double ratio,
-                        int sfp, double xmax, int threads) {
+                        int sfp, double xmax, int threads,
+                        const std::string& mode) {
                 py::gil_scoped_release release;
                 return std::unique_ptr<SelectiveTwoServerSession>(
                     new SelectiveTwoServerSession(
-                        num_clients, rank, ratio, sfp, xmax, threads));
+                        num_clients, rank, ratio, sfp, xmax, threads, mode));
             }),
             py::arg("num_clients"),
             py::arg("rank"),
             py::arg("ratio"),
             py::arg("sfp"),
             py::arg("xmax"),
-            py::arg("threads"))
+            py::arg("threads"),
+            py::arg("mode") = "sel-2s")
         .def(
             "encrypt_client",
             [](SelectiveTwoServerSession& session,
                int client_id, int round_id, const py::list& layers) {
+                const auto parse_started = std::chrono::steady_clock::now();
                 std::vector<FloatLayerInput> parsed;
                 parsed.reserve(layers.size());
                 for (const py::handle& item : layers) {
                     parsed.push_back(parse_layer(py::cast<py::dict>(item)));
                 }
-                py::gil_scoped_release release;
-                return session.encrypt_client(client_id, round_id, parsed);
+                const double parse_wall_sec = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - parse_started).count();
+                std::shared_ptr<NativeClientUpdate> result;
+                {
+                    py::gil_scoped_release release;
+                    result = session.encrypt_client(client_id, round_id, parsed);
+                }
+                result->binding_input_copy_wall_sec = parse_wall_sec;
+                return result;
             },
             py::arg("client_id"),
             py::arg("round_id"),
@@ -148,21 +237,26 @@ PYBIND11_MODULE(_seclora_native, module) {
             },
             py::arg("round_id"),
             py::arg("updates"))
+        .def_property_readonly(
+            "last_round_metrics",
+            &SelectiveTwoServerSession::last_round_metrics,
+            py::return_value_policy::reference_internal)
         .def("close", &SelectiveTwoServerSession::close);
 
     module.def(
         "create_session",
         [](int num_clients, int rank, double ratio,
-           int sfp, double xmax, int threads) {
+           int sfp, double xmax, int threads, const std::string& mode) {
             py::gil_scoped_release release;
             return std::unique_ptr<SelectiveTwoServerSession>(
                 new SelectiveTwoServerSession(
-                    num_clients, rank, ratio, sfp, xmax, threads));
+                    num_clients, rank, ratio, sfp, xmax, threads, mode));
         },
         py::arg("num_clients"),
         py::arg("rank"),
         py::arg("ratio"),
         py::arg("sfp"),
         py::arg("xmax"),
-        py::arg("threads"));
+        py::arg("threads"),
+        py::arg("mode") = "sel-2s");
 }

@@ -55,6 +55,86 @@ ROUND_COLS = [
     "aggregate_time",
     "broadcast_size",
 ]
+SECLORA_CLIENT_COLS = [
+    "round",
+    "client_id",
+    "mode",
+    "ratio",
+    "layer_count",
+    "quantize_pack_wall_sec",
+    "precompute_wall_sec",
+    "online_crypto_wall_sec",
+    "serialize_wall_sec",
+    "client_online_wall_sec",
+    "client_total_crypto_wall_sec",
+    "protected_b_labels",
+    "protected_a_labels",
+    "candidate_b_labels",
+    "candidate_a_labels",
+    "encrypted_scalars",
+    "sp_upload_bytes",
+    "sd_upload_bytes",
+    "upload_bytes",
+]
+SECLORA_ROUND_COLS = [
+    "round",
+    "mode",
+    "ratio",
+    "num_clients",
+    "client_online_mean_wall_sec",
+    "client_online_max_wall_sec",
+    "client_total_crypto_mean_wall_sec",
+    "encrypted_scalars_per_client_mean",
+    "fe_aggregate_wall_sec",
+    "bsgs_wall_sec",
+    "cur_skeleton_wall_sec",
+    "decrypt_wall_sec",
+    "sp_wall_sec",
+    "sd_wall_sec",
+    "sd_dfe_mask_wall_sec",
+    "sd_fe_eval_wall_sec",
+    "sd_bsgs_search_wall_sec",
+    "sd_control_wall_sec",
+    "cur_reconstruct_wall_sec",
+    "experiment_verify_wall_sec",
+    "server_common_control_wall_sec",
+    "output_reconstruct_wall_sec",
+    "observed_serial_server_wall_sec",
+    "server_parallel_critical_wall_sec",
+    "system_critical_wall_sec",
+    "network_100mbps_wall_sec",
+    "e2e_100mbps_wall_sec",
+    "sp_upload_bytes_per_client_mean",
+    "sd_upload_bytes_per_client_mean",
+    "upload_bytes_per_client_mean",
+    "upload_bytes_per_client_max",
+    "upload_bytes_all_clients",
+    "download_c_bytes_per_client",
+    "download_m_bytes_per_client",
+    "download_s_bytes_per_client",
+    "download_bytes_per_client",
+    "download_bytes_all_clients",
+    "round_traffic_bytes_all_clients",
+    "protected_skeleton_cells",
+    "pivot_candidate_cells",
+]
+SECLORA_LAYER_COLS = [
+    "round",
+    "mode",
+    "ratio",
+    "layer_id",
+    "layer_name",
+    "rows",
+    "cols",
+    "selected_rank",
+    "baseline_checks",
+    "baseline_relative_error",
+    "decrypted_cells",
+    "pivot_candidate_cells",
+    "download_c_bytes",
+    "download_m_bytes",
+    "download_s_bytes",
+]
 GRAD_NORM_COLS = ["round", "client_id", "step", "layer_name", "grad_norm"]
 
 
@@ -84,12 +164,24 @@ class CsvWriters:
             metrics_dir / "client_round.csv", CLIENT_ROUND_COLS
         )
         self.round = _CsvFile(metrics_dir / "round.csv", ROUND_COLS)
+        self.seclora_client = _CsvFile(
+            metrics_dir / "seclora_client.csv", SECLORA_CLIENT_COLS
+        )
+        self.seclora_round = _CsvFile(
+            metrics_dir / "seclora_round.csv", SECLORA_ROUND_COLS
+        )
+        self.seclora_layer = _CsvFile(
+            metrics_dir / "seclora_layer.csv", SECLORA_LAYER_COLS
+        )
         self.grad_norm = _CsvFile(metrics_dir / "grad_norm.csv", GRAD_NORM_COLS)
 
     def close(self) -> None:
         self.step.close()
         self.client_round.close()
         self.round.close()
+        self.seclora_client.close()
+        self.seclora_round.close()
+        self.seclora_layer.close()
         self.grad_norm.close()
 
 

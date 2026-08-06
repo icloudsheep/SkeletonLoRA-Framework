@@ -39,12 +39,12 @@ class SecLoRAConfig:
         return config
 
     def validate(self) -> None:
-        if self.mode != "sel-2s":
-            raise ValueError(
-                "The first end-to-end milestone supports mode=sel-2s only"
-            )
-        if not 0.0 <= self.ratio < 1.0:
+        if self.mode not in {"sel-2s", "full-sk"}:
+            raise ValueError("secure_aggregation.mode must be sel-2s or full-sk")
+        if self.mode == "sel-2s" and not 0.0 <= self.ratio < 1.0:
             raise ValueError("secure_aggregation.ratio must be in [0, 1)")
+        if self.mode == "full-sk" and self.ratio != 1.0:
+            raise ValueError("FULL+SK requires secure_aggregation.ratio=1.0")
         if not 1 <= self.sfp <= 30:
             raise ValueError("secure_aggregation.sfp must be in [1, 30]")
         if self.xmax <= 0.0:

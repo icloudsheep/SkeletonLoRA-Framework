@@ -37,14 +37,31 @@ struct NativeLayerUpload {
     // S_D package: unselected slots remain unused.
     std::vector<A_Ciphertext_Slot> encrypted_a;
     std::vector<B_SecretKey_Slot> encrypted_b;
+    std::size_t sp_plain_bytes = 0;
+    std::size_t sd_cipher_bytes = 0;
     std::size_t serialized_size_bytes = 0;
+    double quantize_pack_wall_sec = 0.0;
+    double precompute_wall_sec = 0.0;
+    double online_crypto_wall_sec = 0.0;
+    double serialize_wall_sec = 0.0;
 };
 
 struct NativeClientUpdate {
     int client_id = 0;
     int round_id = 0;
     std::vector<NativeLayerUpload> layers;
+    std::size_t sp_plain_bytes = 0;
+    std::size_t sd_cipher_bytes = 0;
     std::size_t serialized_size_bytes = 0;
+    std::size_t protected_b_labels = 0;
+    std::size_t protected_a_labels = 0;
+    std::size_t candidate_b_labels = 0;
+    std::size_t candidate_a_labels = 0;
+    double binding_input_copy_wall_sec = 0.0;
+    double quantize_pack_wall_sec = 0.0;
+    double precompute_wall_sec = 0.0;
+    double online_crypto_wall_sec = 0.0;
+    double serialize_wall_sec = 0.0;
 };
 
 struct NativeLayerSkeleton {
@@ -55,15 +72,43 @@ struct NativeLayerSkeleton {
     std::vector<std::vector<long long>> m;
     std::vector<std::vector<long long>> s;
     int selected_rank = 0;
+    std::vector<int> pivot_rows;
+    std::vector<int> pivot_cols;
     int baseline_checks = 0;
     double baseline_relative_error = 0.0;
     std::size_t decrypted_cells = 0;
+    std::size_t pivot_candidate_cells = 0;
+    std::size_t download_c_bytes = 0;
+    std::size_t download_m_bytes = 0;
+    std::size_t download_s_bytes = 0;
+};
+
+struct NativeRoundMetrics {
+    std::string mode;
+    double sp_wall_sec = 0.0;
+    double sd_wall_sec = 0.0;
+    double sd_dfe_mask_wall_sec = 0.0;
+    double sd_fe_eval_wall_sec = 0.0;
+    double sd_bsgs_search_wall_sec = 0.0;
+    double sd_control_wall_sec = 0.0;
+    double cur_skeleton_wall_sec = 0.0;
+    double cur_reconstruct_wall_sec = 0.0;
+    double experiment_verify_wall_sec = 0.0;
+    double server_common_control_wall_sec = 0.0;
+    double observed_serial_server_wall_sec = 0.0;
+    std::size_t protected_skeleton_cells = 0;
+    std::size_t pivot_candidate_cells = 0;
+    std::size_t download_c_bytes_per_client = 0;
+    std::size_t download_m_bytes_per_client = 0;
+    std::size_t download_s_bytes_per_client = 0;
+    std::size_t download_bytes_per_client = 0;
 };
 
 class SelectiveTwoServerSession {
 public:
     SelectiveTwoServerSession(int num_clients, int rank, double ratio,
-                              int sfp, double xmax, int threads);
+                              int sfp, double xmax, int threads,
+                              const std::string& mode = "sel-2s");
 
     std::shared_ptr<NativeClientUpdate> encrypt_client(
         int client_id, int round_id, const std::vector<FloatLayerInput>& layers);
@@ -71,6 +116,10 @@ public:
     std::vector<NativeLayerSkeleton> aggregate_round(
         int round_id,
         const std::vector<std::shared_ptr<NativeClientUpdate>>& updates);
+
+    const NativeRoundMetrics& last_round_metrics() const {
+        return last_round_metrics_;
+    }
 
     void close();
 
@@ -84,7 +133,10 @@ private:
     long long encoded_bound_;
     long long bsgs_bound_;
     int threads_;
+    std::string mode_;
+    bool full_sk_ = false;
     bool closed_ = false;
+    NativeRoundMetrics last_round_metrics_;
 
     SecLoRA_PP pp_;
     DmcfePublicParams2 dfe_pp_;

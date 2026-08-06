@@ -32,23 +32,44 @@ FloatLayerInput make_layer(int client_id) {
 
 }  // namespace
 
-int main() {
-    SelectiveTwoServerSession session(2, 2, 0.25, 4, 8.0, 2);
+bool run_mode(const char* mode, double ratio) {
+    SelectiveTwoServerSession session(2, 2, ratio, 4, 8.0, 2, mode);
     std::vector<std::shared_ptr<NativeClientUpdate>> updates;
     for (int client = 0; client < 2; ++client) {
         updates.push_back(
             session.encrypt_client(client, 1, {make_layer(client)}));
     }
     const auto result = session.aggregate_round(1, updates);
+    const bool selective = std::string(mode) == "sel-2s";
+    const std::size_t expected_download = result.empty() ? 0 :
+        static_cast<std::size_t>(result[0].selected_rank) *
+        (result[0].rows + result[0].cols - result[0].selected_rank) * 8;
+    const NativeRoundMetrics& metrics = session.last_round_metrics();
     const bool passed =
         result.size() == 1 &&
         result[0].selected_rank == 2 &&
-        result[0].decrypted_cells == 12 &&
+        (!selective || result[0].decrypted_cells == 12) &&
+        updates[0]->serialized_size_bytes ==
+            updates[0]->sp_plain_bytes + updates[0]->sd_cipher_bytes &&
+        (selective || updates[0]->sp_plain_bytes == 0) &&
+        metrics.download_bytes_per_client == expected_download &&
+        metrics.cur_skeleton_wall_sec >= metrics.cur_reconstruct_wall_sec &&
+        metrics.sd_wall_sec >=
+            metrics.sd_dfe_mask_wall_sec +
+            metrics.sd_fe_eval_wall_sec +
+            metrics.sd_bsgs_search_wall_sec &&
         result[0].baseline_relative_error <= 1e-8;
     std::printf(
-        "SEL-2S PC-DMCFE session: %s (rank=%d, error=%.3e)\n",
+        "%s PC-DMCFE session: %s (rank=%d, error=%.3e)\n",
+        mode,
         passed ? "PASS" : "FAIL",
         result.empty() ? -1 : result[0].selected_rank,
         result.empty() ? -1.0 : result[0].baseline_relative_error);
-    return passed ? 0 : 1;
+    return passed;
+}
+
+int main() {
+    const bool selective_passed = run_mode("sel-2s", 0.25);
+    const bool full_passed = run_mode("full-sk", 1.0);
+    return selective_passed && full_passed ? 0 : 1;
 }

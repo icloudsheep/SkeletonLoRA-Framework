@@ -1,6 +1,8 @@
 """RUN_ID 与目录准备,让 main 只调一个函数拿到全部路径。"""
 
 import datetime as _dt
+import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,7 +21,15 @@ class RunPaths:
 
 
 def prepare_run_paths(root: Path) -> RunPaths:
-    run_id = _dt.datetime.now().strftime(_TIMESTAMP_FMT)
+    timestamp = _dt.datetime.now().strftime(_TIMESTAMP_FMT)
+    requested_name = os.environ.get("RUN_NAME", "").strip()
+    if requested_name:
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", requested_name).strip("-")
+        if not safe_name:
+            raise ValueError("RUN_NAME must contain a filename-safe character")
+        run_id = f"{safe_name}_{timestamp}"
+    else:
+        run_id = timestamp
     log_dir = root / "logs" / run_id
     out_dir = root / "output" / run_id
     paths = RunPaths(

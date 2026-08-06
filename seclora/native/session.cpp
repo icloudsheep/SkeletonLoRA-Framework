@@ -21,6 +21,12 @@ namespace {
 
 constexpr Real kBaselineRelativeTolerance = 1e-8L;
 
+using Clock = std::chrono::steady_clock;
+
+double elapsed_seconds(const Clock::time_point& started) {
+    return std::chrono::duration<double>(Clock::now() - started).count();
+}
+
 template <class F>
 void parallel_for(int count, int threads, const F& fn) {
     if (threads <= 1 || count <= 1) {
@@ -235,6 +241,65 @@ std::size_t b_slot_bytes(const B_SecretKey_Slot& slot) {
     return bytes;
 }
 
+void append_wire_i64(std::vector<unsigned char>& payload, long long value) {
+    const uint64_t encoded = static_cast<uint64_t>(value);
+    for (int shift = 56; shift >= 0; shift -= 8) {
+        payload.push_back(
+            static_cast<unsigned char>((encoded >> shift) & 0xffU));
+    }
+}
+
+std::size_t serialize_plain_slices(
+    const IntMat& plain_b, const IntMat& plain_a) {
+    std::size_t values = 0;
+    for (const auto& row : plain_b) values += row.size();
+    for (const auto& row : plain_a) values += row.size();
+    std::vector<unsigned char> payload;
+    payload.reserve(values * 8);
+    for (const auto& row : plain_b) {
+        for (long long value : row) append_wire_i64(payload, value);
+    }
+    for (const auto& row : plain_a) {
+        for (long long value : row) append_wire_i64(payload, value);
+    }
+    return payload.size();
+}
+
+void serialize_skeleton_parts(NativeLayerSkeleton& skeleton) {
+    std::vector<unsigned char> c_payload;
+    std::vector<unsigned char> m_payload;
+    std::vector<unsigned char> s_payload;
+    const int rank = skeleton.selected_rank;
+    for (int row = 0; row < skeleton.rows; ++row) {
+        if (std::find(
+                skeleton.pivot_rows.begin(), skeleton.pivot_rows.end(), row) !=
+            skeleton.pivot_rows.end()) {
+            continue;
+        }
+        for (int col = 0; col < rank; ++col) {
+            append_wire_i64(c_payload, skeleton.c[row][col]);
+        }
+    }
+    for (int row = 0; row < rank; ++row) {
+        for (int col = 0; col < rank; ++col) {
+            append_wire_i64(m_payload, skeleton.m[row][col]);
+        }
+    }
+    for (int row = 0; row < rank; ++row) {
+        for (int col = 0; col < skeleton.cols; ++col) {
+            if (std::find(
+                    skeleton.pivot_cols.begin(), skeleton.pivot_cols.end(), col) !=
+                skeleton.pivot_cols.end()) {
+                continue;
+            }
+            append_wire_i64(s_payload, skeleton.s[row][col]);
+        }
+    }
+    skeleton.download_c_bytes = c_payload.size();
+    skeleton.download_m_bytes = m_payload.size();
+    skeleton.download_s_bytes = s_payload.size();
+}
+
 long long checked_int64(__int128 value, const char* context) {
     if (value < std::numeric_limits<long long>::min() ||
         value > std::numeric_limits<long long>::max()) {
@@ -246,7 +311,8 @@ long long checked_int64(__int128 value, const char* context) {
 }  // namespace
 
 SelectiveTwoServerSession::SelectiveTwoServerSession(
-    int num_clients, int rank, double ratio, int sfp, double xmax, int threads)
+    int num_clients, int rank, double ratio, int sfp, double xmax, int threads,
+    const std::string& mode)
     : num_clients_(num_clients),
       rank_(rank),
       ratio_(ratio),
@@ -255,13 +321,19 @@ SelectiveTwoServerSession::SelectiveTwoServerSession(
       xmax_(xmax),
       encoded_bound_(0),
       bsgs_bound_(0),
-      threads_(threads) {
+      threads_(threads),
+      mode_(mode),
+      full_sk_(mode == "full-sk") {
     if (num_clients_ <= 0 || rank_ <= 0) {
         throw std::invalid_argument("num_clients and rank must be positive");
     }
-    if (!(ratio_ >= 0.0 && ratio_ < 1.0)) {
+    if (mode_ != "sel-2s" && mode_ != "full-sk") {
+        throw std::invalid_argument("mode must be sel-2s or full-sk");
+    }
+    if (!full_sk_ && !(ratio_ >= 0.0 && ratio_ < 1.0)) {
         throw std::invalid_argument("SEL-2S ratio must be in [0, 1)");
     }
+    if (full_sk_) ratio_ = 1.0;
     if (sfp_ < 1 || sfp_ > 30 || threads_ <= 0) {
         throw std::invalid_argument("sfp must be in [1, 30] and threads positive");
     }
@@ -359,11 +431,12 @@ SelectiveTwoServerSession::encrypt_client(
             layer.b.size() != static_cast<std::size_t>(layer.rows * rank_)) {
             throw std::invalid_argument("invalid LoRA layer dimensions");
         }
+        const auto quantize_pack_started = Clock::now();
         IntMat a = quantize_a(layer);
         IntMat b = quantize_b(layer);
-        const int eb = static_cast<int>(
+        const int eb = full_sk_ ? layer.rows : static_cast<int>(
             std::ceil(ratio_ * static_cast<double>(layer.rows)));
-        const int ea = static_cast<int>(
+        const int ea = full_sk_ ? layer.cols : static_cast<int>(
             std::ceil(ratio_ * static_cast<double>(layer.cols)));
         const int candidate_count = 2 * num_clients_ * rank_;
         const auto oracle_key =
@@ -398,21 +471,25 @@ SelectiveTwoServerSession::encrypt_client(
         payload.encrypted_b_rows = eb;
         payload.encrypted_a_cols = ea;
         payload.candidate_rows = public_candidates(
-            eb, layer.rows, candidate_count, 0x425f43414e44ULL);
+            full_sk_ ? 0 : eb, layer.rows, candidate_count,
+            0x425f43414e44ULL);
         payload.candidate_cols = public_candidates(
-            ea, layer.cols, candidate_count, 0x415f43414e44ULL);
+            full_sk_ ? 0 : ea, layer.cols, candidate_count,
+            0x415f43414e44ULL);
 
-        payload.plain_b.assign(
-            layer.rows - eb, std::vector<long long>(rank_));
-        for (int row = eb; row < layer.rows; ++row) {
-            payload.plain_b[row - eb] = b[row];
-        }
-        payload.plain_a.assign(
-            rank_, std::vector<long long>(layer.cols - ea));
-        for (int k = 0; k < rank_; ++k) {
-            std::copy(
-                a[k].begin() + ea, a[k].end(),
-                payload.plain_a[k].begin());
+        if (!full_sk_) {
+            payload.plain_b.assign(
+                layer.rows - eb, std::vector<long long>(rank_));
+            for (int row = eb; row < layer.rows; ++row) {
+                payload.plain_b[row - eb] = b[row];
+            }
+            payload.plain_a.assign(
+                rank_, std::vector<long long>(layer.cols - ea));
+            for (int k = 0; k < rank_; ++k) {
+                std::copy(
+                    a[k].begin() + ea, a[k].end(),
+                    payload.plain_a[k].begin());
+            }
         }
 
         std::vector<int> encrypted_rows;
@@ -434,6 +511,9 @@ SelectiveTwoServerSession::encrypt_client(
 
         PC_MCFE_Client& client = *clients_[client_id];
         client.SetLoraMatrices(a, b);
+        payload.quantize_pack_wall_sec =
+            elapsed_seconds(quantize_pack_started);
+        const auto precompute_started = Clock::now();
         client.u_setup();
         try {
             client.precompute_encA_indices_mt(
@@ -442,33 +522,59 @@ SelectiveTwoServerSession::encrypt_client(
             client.precompute_encB_indices_mt(
                 layer.layer_id, 0, round_id, layer.rows,
                 encrypted_rows, threads_);
+            payload.precompute_wall_sec = elapsed_seconds(precompute_started);
+
+            const auto online_started = Clock::now();
             payload.encrypted_a = client.encA_indices_mt(
                 layer.layer_id, 0, round_id, layer.cols,
                 encrypted_cols, threads_);
             payload.encrypted_b = client.encB_indices_mt(
                 layer.layer_id, 0, round_id, layer.rows,
                 encrypted_rows, threads_);
+            payload.online_crypto_wall_sec = elapsed_seconds(online_started);
         } catch (...) {
             client.ClearEncryptionPrecompute();
             throw;
         }
+        const auto precompute_cleanup_started = Clock::now();
         client.ClearEncryptionPrecompute();
+        payload.precompute_wall_sec +=
+            elapsed_seconds(precompute_cleanup_started);
 
         oracle.client_a[client_id] = a;
         oracle.client_b[client_id] = b;
         oracle.present[client_id] = 1;
 
-        payload.serialized_size_bytes =
-            (static_cast<std::size_t>(layer.rows - eb) * rank_ +
-             static_cast<std::size_t>(layer.cols - ea) * rank_) *
-            sizeof(long long);
+        const auto serialize_started = Clock::now();
+        payload.sp_plain_bytes = serialize_plain_slices(
+            payload.plain_b, payload.plain_a);
         for (int col : encrypted_cols) {
-            payload.serialized_size_bytes += a_slot_bytes(payload.encrypted_a[col]);
+            payload.sd_cipher_bytes += a_slot_bytes(payload.encrypted_a[col]);
         }
         for (int row : encrypted_rows) {
-            payload.serialized_size_bytes += b_slot_bytes(payload.encrypted_b[row]);
+            payload.sd_cipher_bytes += b_slot_bytes(payload.encrypted_b[row]);
         }
+        payload.serialized_size_bytes =
+            payload.sp_plain_bytes + payload.sd_cipher_bytes;
+        payload.serialize_wall_sec = elapsed_seconds(serialize_started);
+
+        update->sp_plain_bytes += payload.sp_plain_bytes;
+        update->sd_cipher_bytes += payload.sd_cipher_bytes;
         update->serialized_size_bytes += payload.serialized_size_bytes;
+        update->protected_b_labels += static_cast<std::size_t>(eb);
+        update->protected_a_labels += static_cast<std::size_t>(ea);
+        if (!full_sk_) {
+            if (ea > 0) {
+                update->candidate_b_labels += payload.candidate_rows.size();
+            }
+            if (eb > 0) {
+                update->candidate_a_labels += payload.candidate_cols.size();
+            }
+        }
+        update->quantize_pack_wall_sec += payload.quantize_pack_wall_sec;
+        update->precompute_wall_sec += payload.precompute_wall_sec;
+        update->online_crypto_wall_sec += payload.online_crypto_wall_sec;
+        update->serialize_wall_sec += payload.serialize_wall_sec;
         update->layers.push_back(std::move(payload));
     }
     std::fprintf(stderr, "\n");
@@ -480,6 +586,9 @@ SelectiveTwoServerSession::aggregate_round(
     int round_id,
     const std::vector<std::shared_ptr<NativeClientUpdate>>& updates) {
     require_open();
+    const auto aggregate_started = Clock::now();
+    last_round_metrics_ = NativeRoundMetrics();
+    last_round_metrics_.mode = mode_;
     if (static_cast<int>(updates.size()) != num_clients_) {
         throw std::invalid_argument("aggregate_round requires every configured client");
     }
@@ -529,6 +638,9 @@ SelectiveTwoServerSession::aggregate_round(
         }
 
         auto sp_cell = [&](int row, int col) {
+            if (full_sk_) {
+                throw std::logic_error("FULL+SK has no plaintext server cells");
+            }
             __int128 sum = 0;
             for (const auto* update : ordered) {
                 const NativeLayerUpload& layer = update->layers[layer_index];
@@ -542,23 +654,10 @@ SelectiveTwoServerSession::aggregate_round(
 
         const int aggregate_rank_cap =
             std::min(std::min(rows, cols), num_clients_ * rank_);
-        if (eb >= rows || ea >= cols) {
+        if (!full_sk_ && (eb >= rows || ea >= cols)) {
             throw std::runtime_error(
                 "SEL-2S needs a nonempty plaintext row and column region");
         }
-
-        auto candidate_pivots = select_square_pivots(
-            first.candidate_rows, first.candidate_cols,
-            aggregate_rank_cap, sp_cell);
-        if (candidate_pivots.first.size() < static_cast<std::size_t>(rank_)) {
-            throw std::runtime_error(
-                "public pivot candidate pool cannot form the initial "
-                "rank-R nonsingular skeleton");
-        }
-
-        const std::vector<int>& pivot_rows = candidate_pivots.first;
-        const std::vector<int>& pivot_cols = candidate_pivots.second;
-        const int available_rank = static_cast<int>(pivot_rows.size());
 
         const auto oracle_key =
             std::make_pair(round_id, first.layer_id);
@@ -575,6 +674,133 @@ SelectiveTwoServerSession::aggregate_round(
                 "plaintext evaluation oracle is missing a client update");
         }
 
+        std::vector<const std::vector<A_Ciphertext_Slot>*> a_refs;
+        std::vector<const std::vector<B_SecretKey_Slot>*> b_refs;
+        a_refs.reserve(num_clients_);
+        b_refs.reserve(num_clients_);
+        for (const auto* update : ordered) {
+            const NativeLayerUpload& layer = update->layers[layer_index];
+            a_refs.push_back(&layer.encrypted_a);
+            b_refs.push_back(&layer.encrypted_b);
+        }
+        std::vector<int> encrypted_cols;
+        for (int col = 0; col < ea; ++col) {
+            encrypted_cols.push_back(col);
+        }
+        if (!full_sk_ && eb > 0) {
+            for (int col : first.candidate_cols) {
+                append_unique(encrypted_cols, col);
+            }
+        }
+        std::sort(encrypted_cols.begin(), encrypted_cols.end());
+        double dfe_worker_seconds = 0.0;
+        const auto dfe_started = Clock::now();
+        server_->PrepareDfeMaskCacheRefs(
+            a_refs, weights_, aggregate_key_, encrypted_cols,
+            threads_, dfe_worker_seconds);
+        last_round_metrics_.sd_dfe_mask_wall_sec +=
+            elapsed_seconds(dfe_started);
+
+        auto decrypt_batch = [&](const std::vector<std::pair<int, int>>& cells) {
+            const auto batch_started = Clock::now();
+            std::vector<GT> groups(cells.size());
+            const auto fe_started = Clock::now();
+            parallel_for(
+                static_cast<int>(cells.size()), threads_, [&](int index) {
+                    groups[index] = server_->eval_one_cell_group_refs(
+                        a_refs, b_refs, weights_, first.layer_id, 0,
+                        round_id, cells[index].first, cells[index].second);
+                });
+            const double fe_seconds = elapsed_seconds(fe_started);
+            last_round_metrics_.sd_fe_eval_wall_sec += fe_seconds;
+
+            std::vector<long long> values(cells.size(), 0);
+            std::vector<unsigned char> found(cells.size(), 0);
+            const auto bsgs_started = Clock::now();
+            parallel_for(
+                static_cast<int>(cells.size()), threads_, [&](int index) {
+                    bool cell_found = false;
+                    values[index] = server_->bsgs_search(
+                        groups[index], cell_found);
+                    found[index] = cell_found ? 1 : 0;
+                });
+            const double bsgs_seconds = elapsed_seconds(bsgs_started);
+            last_round_metrics_.sd_bsgs_search_wall_sec += bsgs_seconds;
+            for (unsigned char value : found) {
+                if (!value) {
+                    throw std::runtime_error(
+                        "BSGS failed for an encrypted aggregate cell; "
+                        "check sfp, xmax, and the public bound");
+                }
+            }
+            last_round_metrics_.sd_control_wall_sec += std::max(
+                0.0,
+                elapsed_seconds(batch_started) - fe_seconds - bsgs_seconds);
+            return values;
+        };
+
+        std::pair<std::vector<int>, std::vector<int>> candidate_pivots;
+        std::map<std::pair<int, int>, long long> encrypted_cell_cache;
+        if (full_sk_) {
+            const auto candidate_prepare_started = Clock::now();
+            std::vector<std::pair<int, int>> candidate_cells;
+            candidate_cells.reserve(
+                first.candidate_rows.size() * first.candidate_cols.size());
+            for (int row : first.candidate_rows) {
+                for (int col : first.candidate_cols) {
+                    candidate_cells.emplace_back(row, col);
+                }
+            }
+            last_round_metrics_.cur_skeleton_wall_sec +=
+                elapsed_seconds(candidate_prepare_started);
+            const std::vector<long long> candidate_values =
+                decrypt_batch(candidate_cells);
+            const auto candidate_control_started = Clock::now();
+            for (std::size_t index = 0; index < candidate_cells.size(); ++index) {
+                encrypted_cell_cache[candidate_cells[index]] =
+                    candidate_values[index];
+            }
+            last_round_metrics_.pivot_candidate_cells +=
+                candidate_cells.size();
+            candidate_pivots = select_square_pivots(
+                first.candidate_rows, first.candidate_cols,
+                aggregate_rank_cap,
+                [&](int row, int col) {
+                    return encrypted_cell_cache.at(std::make_pair(row, col));
+                });
+            last_round_metrics_.cur_skeleton_wall_sec +=
+                elapsed_seconds(candidate_control_started);
+        } else {
+            std::map<std::pair<int, int>, long long> candidate_values;
+            const auto sp_candidate_started = Clock::now();
+            for (int row : first.candidate_rows) {
+                for (int col : first.candidate_cols) {
+                    candidate_values.emplace(
+                        std::make_pair(row, col), sp_cell(row, col));
+                }
+            }
+            last_round_metrics_.sp_wall_sec +=
+                elapsed_seconds(sp_candidate_started);
+            const auto pivot_select_started = Clock::now();
+            candidate_pivots = select_square_pivots(
+                first.candidate_rows, first.candidate_cols,
+                aggregate_rank_cap,
+                [&](int row, int col) {
+                    return candidate_values.at(std::make_pair(row, col));
+                });
+            last_round_metrics_.cur_skeleton_wall_sec +=
+                elapsed_seconds(pivot_select_started);
+        }
+        if (candidate_pivots.first.size() < static_cast<std::size_t>(rank_)) {
+            throw std::runtime_error(
+                "public pivot candidate pool cannot form the initial "
+                "rank-R nonsingular skeleton");
+        }
+
+        const std::vector<int>& pivot_rows = candidate_pivots.first;
+        const std::vector<int>& pivot_cols = candidate_pivots.second;
+        const int available_rank = static_cast<int>(pivot_rows.size());
+
         const int factor_width = num_clients_ * rank_;
         auto oracle_b = [&](int row, int component) -> Real {
             const int client = component / rank_;
@@ -587,6 +813,7 @@ SelectiveTwoServerSession::aggregate_round(
             return static_cast<Real>(oracle.client_a[client][k][col]);
         };
 
+        const auto baseline_setup_started = Clock::now();
         RealMat btb(
             factor_width, std::vector<Real>(factor_width, 0));
         RealMat aat(
@@ -614,37 +841,18 @@ SelectiveTwoServerSession::aggregate_round(
             throw std::runtime_error(
                 "plaintext fixed-point baseline has zero Frobenius norm");
         }
+        last_round_metrics_.experiment_verify_wall_sec +=
+            elapsed_seconds(baseline_setup_started);
 
-        std::vector<const std::vector<A_Ciphertext_Slot>*> a_refs;
-        std::vector<const std::vector<B_SecretKey_Slot>*> b_refs;
-        a_refs.reserve(num_clients_);
-        b_refs.reserve(num_clients_);
-        for (const auto* update : ordered) {
-            const NativeLayerUpload& layer = update->layers[layer_index];
-            a_refs.push_back(&layer.encrypted_a);
-            b_refs.push_back(&layer.encrypted_b);
-        }
-        std::vector<int> encrypted_cols;
-        for (int col = 0; col < ea; ++col) {
-            encrypted_cols.push_back(col);
-        }
-        if (eb > 0) {
-            for (int col : first.candidate_cols) {
-                append_unique(encrypted_cols, col);
-            }
-        }
-        std::sort(encrypted_cols.begin(), encrypted_cols.end());
-        double dfe_worker_seconds = 0.0;
-        server_->PrepareDfeMaskCacheRefs(
-            a_refs, weights_, aggregate_key_, encrypted_cols,
-            threads_, dfe_worker_seconds);
-
+        const auto skeleton_cache_started = Clock::now();
         IntMat cached_c(
             rows, std::vector<long long>(available_rank, 0));
         IntMat cached_m(
             available_rank, std::vector<long long>(available_rank, 0));
         IntMat cached_s(
             available_rank, std::vector<long long>(cols, 0));
+        last_round_metrics_.cur_skeleton_wall_sec +=
+            elapsed_seconds(skeleton_cache_started);
 
         struct DecryptCell {
             int row;
@@ -665,66 +873,93 @@ SelectiveTwoServerSession::aggregate_round(
              ++current_rank) {
             const int added_begin =
                 previous_rank == 0 ? 0 : current_rank - 1;
-            for (int t = added_begin; t < current_rank; ++t) {
-                for (int row = eb; row < rows; ++row) {
-                    cached_c[row][t] = sp_cell(row, pivot_cols[t]);
+            if (!full_sk_) {
+                const auto sp_skeleton_started = Clock::now();
+                for (int t = added_begin; t < current_rank; ++t) {
+                    for (int row = eb; row < rows; ++row) {
+                        cached_c[row][t] = sp_cell(row, pivot_cols[t]);
+                    }
+                    for (int col = ea; col < cols; ++col) {
+                        cached_s[t][col] = sp_cell(pivot_rows[t], col);
+                    }
+                    for (int j = 0; j <= t; ++j) {
+                        cached_m[t][j] =
+                            sp_cell(pivot_rows[t], pivot_cols[j]);
+                        cached_m[j][t] =
+                            sp_cell(pivot_rows[j], pivot_cols[t]);
+                    }
                 }
-                for (int col = ea; col < cols; ++col) {
-                    cached_s[t][col] = sp_cell(pivot_rows[t], col);
-                }
-                for (int j = 0; j <= t; ++j) {
-                    cached_m[t][j] =
-                        sp_cell(pivot_rows[t], pivot_cols[j]);
-                    cached_m[j][t] =
-                        sp_cell(pivot_rows[j], pivot_cols[t]);
-                }
+                last_round_metrics_.sp_wall_sec +=
+                    elapsed_seconds(sp_skeleton_started);
             }
 
+            const auto sd_prepare_started = Clock::now();
             std::vector<DecryptCell> work;
+            const int encrypted_row_limit = full_sk_ ? rows : eb;
+            const int encrypted_col_limit = full_sk_ ? cols : ea;
             work.reserve(
-                static_cast<std::size_t>(eb + ea) *
+                static_cast<std::size_t>(
+                    encrypted_row_limit + encrypted_col_limit) *
                 (current_rank - added_begin));
             for (int t = added_begin; t < current_rank; ++t) {
-                for (int row = 0; row < eb; ++row) {
+                for (int row = 0; row < encrypted_row_limit; ++row) {
                     work.push_back({row, pivot_cols[t], row, t, true});
                 }
-                for (int col = 0; col < ea; ++col) {
+                for (int col = 0; col < encrypted_col_limit; ++col) {
                     work.push_back({pivot_rows[t], col, t, col, false});
                 }
             }
 
-            std::vector<long long> decrypted(work.size(), 0);
-            std::vector<unsigned char> found(work.size(), 0);
-            parallel_for(
-                static_cast<int>(work.size()), threads_, [&](int index) {
-                    const DecryptCell& cell = work[index];
-                    GT group = server_->eval_one_cell_group_refs(
-                        a_refs, b_refs, weights_,
-                        first.layer_id, 0, round_id, cell.row, cell.col);
-                    bool cell_found = false;
-                    decrypted[index] =
-                        server_->bsgs_search(group, cell_found);
-                    found[index] = cell_found ? 1 : 0;
-                });
-            for (std::size_t index = 0; index < work.size(); ++index) {
-                if (!found[index]) {
-                    throw std::runtime_error(
-                        "BSGS failed for a protected skeleton cell; "
-                        "check sfp, xmax, and the public bound");
-                }
-                const DecryptCell& cell = work[index];
-                if (cell.writes_c) {
-                    cached_c[cell.skeleton_row][cell.skeleton_col] =
-                        decrypted[index];
-                } else {
-                    cached_s[cell.skeleton_row][cell.skeleton_col] =
-                        decrypted[index];
+            std::vector<std::pair<int, int>> missing_cells;
+            for (const DecryptCell& cell : work) {
+                const auto coordinate = std::make_pair(cell.row, cell.col);
+                if (encrypted_cell_cache.find(coordinate) ==
+                    encrypted_cell_cache.end()) {
+                    encrypted_cell_cache.emplace(
+                        coordinate, std::numeric_limits<long long>::min());
+                    missing_cells.push_back(coordinate);
                 }
             }
-            decrypted_cells += work.size();
+            last_round_metrics_.cur_skeleton_wall_sec +=
+                elapsed_seconds(sd_prepare_started);
+            const std::vector<long long> missing_values =
+                decrypt_batch(missing_cells);
+            const auto sd_assign_started = Clock::now();
+            for (std::size_t index = 0; index < missing_cells.size(); ++index) {
+                encrypted_cell_cache[missing_cells[index]] =
+                    missing_values[index];
+            }
+            for (const DecryptCell& cell : work) {
+                const long long value = encrypted_cell_cache.at(
+                    std::make_pair(cell.row, cell.col));
+                if (cell.writes_c) {
+                    cached_c[cell.skeleton_row][cell.skeleton_col] =
+                        value;
+                } else {
+                    cached_s[cell.skeleton_row][cell.skeleton_col] =
+                        value;
+                }
+            }
+            decrypted_cells += missing_cells.size();
 
+            if (full_sk_) {
+                for (int t = added_begin; t < current_rank; ++t) {
+                    for (int j = 0; j <= t; ++j) {
+                        cached_m[t][j] = cached_c[pivot_rows[t]][j];
+                        cached_m[j][t] = cached_c[pivot_rows[j]][t];
+                    }
+                }
+            }
+            last_round_metrics_.cur_skeleton_wall_sec +=
+                elapsed_seconds(sd_assign_started);
+
+            const auto cur_started = Clock::now();
             const RealMat solved = solve_nonsingular_real(
                 cached_m, cached_s, current_rank, cols);
+            const double cur_solve_seconds = elapsed_seconds(cur_started);
+            last_round_metrics_.cur_reconstruct_wall_sec += cur_solve_seconds;
+            last_round_metrics_.cur_skeleton_wall_sec += cur_solve_seconds;
+            const auto verify_started = Clock::now();
             RealMat ctc(
                 current_rank, std::vector<Real>(current_rank, 0));
             RealMat xxt(
@@ -795,6 +1030,8 @@ SelectiveTwoServerSession::aggregate_round(
                 std::sqrt(error_norm_sq / baseline_norm_sq);
             ++baseline_checks;
             verified = relative_error <= kBaselineRelativeTolerance;
+            last_round_metrics_.experiment_verify_wall_sec +=
+                elapsed_seconds(verify_started);
             std::fprintf(
                 stderr,
                 "[SecLoRA] layer %d rank %d baseline error %.3Le %s\n",
@@ -802,14 +1039,24 @@ SelectiveTwoServerSession::aggregate_round(
                 relative_error,
                 verified ? "PASS" : "FAIL");
             if (verified) {
+                const auto skeleton_output_started = Clock::now();
                 skeleton.layer_id = first.layer_id;
                 skeleton.rows = rows;
                 skeleton.cols = cols;
                 skeleton.selected_rank = current_rank;
+                skeleton.pivot_rows.assign(
+                    pivot_rows.begin(), pivot_rows.begin() + current_rank);
+                skeleton.pivot_cols.assign(
+                    pivot_cols.begin(), pivot_cols.begin() + current_rank);
                 skeleton.baseline_checks = baseline_checks;
                 skeleton.baseline_relative_error =
                     static_cast<double>(relative_error);
-                skeleton.decrypted_cells = decrypted_cells;
+                skeleton.decrypted_cells = full_sk_
+                    ? encrypted_cell_cache.size()
+                    : decrypted_cells;
+                skeleton.pivot_candidate_cells = full_sk_
+                    ? first.candidate_rows.size() * first.candidate_cols.size()
+                    : 0;
                 skeleton.c.assign(
                     rows, std::vector<long long>(current_rank));
                 for (int row = 0; row < rows; ++row) {
@@ -826,6 +1073,23 @@ SelectiveTwoServerSession::aggregate_round(
                 }
                 skeleton.s.assign(
                     cached_s.begin(), cached_s.begin() + current_rank);
+                serialize_skeleton_parts(skeleton);
+                const double skeleton_output_seconds =
+                    elapsed_seconds(skeleton_output_started);
+                last_round_metrics_.cur_reconstruct_wall_sec +=
+                    skeleton_output_seconds;
+                last_round_metrics_.cur_skeleton_wall_sec +=
+                    skeleton_output_seconds;
+                last_round_metrics_.protected_skeleton_cells += full_sk_
+                    ? static_cast<std::size_t>(current_rank) *
+                          (rows + cols - current_rank)
+                    : static_cast<std::size_t>(current_rank) * (eb + ea);
+                last_round_metrics_.download_c_bytes_per_client +=
+                    skeleton.download_c_bytes;
+                last_round_metrics_.download_m_bytes_per_client +=
+                    skeleton.download_m_bytes;
+                last_round_metrics_.download_s_bytes_per_client +=
+                    skeleton.download_s_bytes;
                 break;
             }
             previous_rank = current_rank;
@@ -840,6 +1104,26 @@ SelectiveTwoServerSession::aggregate_round(
         output.push_back(std::move(skeleton));
     }
     std::fprintf(stderr, "\n");
+    last_round_metrics_.download_bytes_per_client =
+        last_round_metrics_.download_c_bytes_per_client +
+        last_round_metrics_.download_m_bytes_per_client +
+        last_round_metrics_.download_s_bytes_per_client;
+    last_round_metrics_.sd_wall_sec =
+        last_round_metrics_.sd_dfe_mask_wall_sec +
+        last_round_metrics_.sd_fe_eval_wall_sec +
+        last_round_metrics_.sd_bsgs_search_wall_sec +
+        last_round_metrics_.sd_control_wall_sec;
+    last_round_metrics_.observed_serial_server_wall_sec =
+        elapsed_seconds(aggregate_started);
+    const double attributed_wall_sec =
+        last_round_metrics_.sp_wall_sec +
+        last_round_metrics_.sd_wall_sec +
+        last_round_metrics_.cur_skeleton_wall_sec +
+        last_round_metrics_.experiment_verify_wall_sec;
+    last_round_metrics_.server_common_control_wall_sec = std::max(
+        0.0,
+        last_round_metrics_.observed_serial_server_wall_sec -
+            attributed_wall_sec);
     return output;
 }
 

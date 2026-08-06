@@ -5,6 +5,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
@@ -22,6 +23,17 @@ class _FakeNativeUpdate:
         self.serialized_size_bytes = sum(
             layer["a"].nbytes + layer["b"].nbytes for layer in layers
         )
+        self.sp_plain_bytes = self.serialized_size_bytes
+        self.sd_cipher_bytes = 0
+        self.protected_b_labels = 0
+        self.protected_a_labels = 0
+        self.candidate_b_labels = 0
+        self.candidate_a_labels = 0
+        self.binding_input_copy_wall_sec = 0.001
+        self.quantize_pack_wall_sec = 0.001
+        self.precompute_wall_sec = 0.002
+        self.online_crypto_wall_sec = 0.003
+        self.serialize_wall_sec = 0.004
 
 
 class _FakeNativeLayer:
@@ -31,6 +43,14 @@ class _FakeNativeLayer:
         self.c = torch.eye(rows, dtype=torch.int64)
         self.m = torch.eye(rows, dtype=torch.int64)
         self.s = product.to(torch.int64)
+        self.selected_rank = rows
+        self.baseline_checks = 1
+        self.baseline_relative_error = 0.0
+        self.decrypted_cells = int(product.numel())
+        self.pivot_candidate_cells = 0
+        self.download_c_bytes = 0
+        self.download_m_bytes = int(rows * rows * 8)
+        self.download_s_bytes = int(product.numel() * 8)
 
 
 class _FakeNativeSession:
@@ -38,6 +58,25 @@ class _FakeNativeSession:
         self.scale = scale
         self.xmax = xmax
         self.closed = False
+        self.last_round_metrics = SimpleNamespace(
+            sp_wall_sec=0.01,
+            sd_wall_sec=0.02,
+            sd_dfe_mask_wall_sec=0.002,
+            sd_fe_eval_wall_sec=0.008,
+            sd_bsgs_search_wall_sec=0.009,
+            sd_control_wall_sec=0.001,
+            cur_skeleton_wall_sec=0.006,
+            cur_reconstruct_wall_sec=0.003,
+            experiment_verify_wall_sec=0.004,
+            server_common_control_wall_sec=0.005,
+            observed_serial_server_wall_sec=0.04,
+            protected_skeleton_cells=1,
+            pivot_candidate_cells=0,
+            download_c_bytes_per_client=0,
+            download_m_bytes_per_client=8,
+            download_s_bytes_per_client=8,
+            download_bytes_per_client=16,
+        )
 
     def encrypt_client(
         self,
@@ -114,6 +153,21 @@ class SecLoRAStateTest(unittest.TestCase):
             )
 
 
+class SecLoRAConfigTest(unittest.TestCase):
+    def test_full_sk_requires_full_ratio(self) -> None:
+        SecLoRAConfig(
+            mode="full-sk", ratio=1.0, sfp=22, xmax=0.03125, threads=25
+        ).validate()
+        with self.assertRaises(ValueError):
+            SecLoRAConfig(
+                mode="full-sk",
+                ratio=0.25,
+                sfp=22,
+                xmax=0.03125,
+                threads=25,
+            ).validate()
+
+
 class SecLoRALowRankTest(unittest.TestCase):
     def test_factorization_does_not_materialize_or_change_product(self) -> None:
         torch.manual_seed(3)
@@ -183,6 +237,16 @@ class SecLoRABackendTest(unittest.TestCase):
             )
             self.assertTrue(torch.allclose(actual, expected, atol=1e-5))
             self.assertGreater(backend.ciphertext_size(updates[0]), 0)
+            metrics = backend.last_aggregate_metrics
+            self.assertAlmostEqual(metrics["fe_aggregate_wall_sec"], 0.01)
+            self.assertAlmostEqual(metrics["bsgs_wall_sec"], 0.009)
+            self.assertAlmostEqual(metrics["cur_skeleton_wall_sec"], 0.006)
+            self.assertAlmostEqual(metrics["decrypt_wall_sec"], 0.031)
+            self.assertAlmostEqual(
+                metrics["server_parallel_critical_wall_sec"],
+                metrics["decrypt_wall_sec"]
+                + metrics["output_reconstruct_wall_sec"],
+            )
             backend.close()
             self.assertTrue(session.closed)
 

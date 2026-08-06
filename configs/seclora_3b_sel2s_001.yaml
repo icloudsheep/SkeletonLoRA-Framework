@@ -1,10 +1,8 @@
-# SecLoRA SEL-2S convergence config derived from loss.yaml.
-
 seed: 42
 
 federated:
-  num_clients: 2
-  num_rounds: 20
+  num_clients: 4
+  num_rounds: 3
   local_steps: 300
 
 lora:
@@ -13,12 +11,11 @@ lora:
   target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
 
 train:
-  batch_size: 2
+  batch_size: 4
   learning_rate: 2.0e-4
   optimizer: adamw
   weight_decay: 0.0
   dtype: float32
-  loss_moving_average_window: 20
 
 model:
   kind: open_llama
@@ -27,11 +24,10 @@ model:
   dtype: float32
 
 dataset:
-  kind: natural_instructions
+  kind: mmlu_train
   split_method: iid_uniform
-  path: ./datasets/natural-instructions
-  max_length: 1024
-  max_samples: 20000
+  path: ./datasets/mmlu/mmlu_auxiliary_train.jsonl
+  max_length: 512
 
 secure_aggregation:
   backend: seclora

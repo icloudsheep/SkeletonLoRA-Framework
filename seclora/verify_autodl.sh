@@ -14,7 +14,8 @@ cd "${ROOT_DIR}"
 
 "${PYTHON_BIN}" -m unittest \
     tests.test_seclora \
-    tests.test_seclora_native
+    tests.test_seclora_native \
+    tests.test_training_metrics
 
 "${PYTHON_BIN}" main.py --config configs/seclora_smoke.yaml
 

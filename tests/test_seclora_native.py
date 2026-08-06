@@ -15,7 +15,7 @@ except ImportError:
 
 @unittest.skipIf(_seclora_native is None, "SecLoRA native extension is not built")
 class SecLoRANativeTest(unittest.TestCase):
-    def test_selective_skeleton_reconstructs_quantized_sum(self) -> None:
+    def _exercise_mode(self, mode: str, ratio: float):
         clients = 2
         rank = 2
         rows = 6
@@ -24,10 +24,11 @@ class SecLoRANativeTest(unittest.TestCase):
         session = _seclora_native.SelectiveTwoServerSession(
             num_clients=clients,
             rank=rank,
-            ratio=0.25,
+            ratio=ratio,
             sfp=8,
             xmax=1.0,
             threads=4,
+            mode=mode,
         )
 
         updates = []
@@ -71,14 +72,34 @@ class SecLoRANativeTest(unittest.TestCase):
             skeleton.selected_rank - rank + 1,
         )
         self.assertLessEqual(skeleton.baseline_relative_error, 1e-8)
-        encrypted_rows = math.ceil(0.25 * rows)
-        encrypted_cols = math.ceil(0.25 * cols)
-        self.assertEqual(
-            skeleton.decrypted_cells,
-            skeleton.selected_rank * (encrypted_rows + encrypted_cols),
-        )
+        if mode == "sel-2s":
+            encrypted_rows = math.ceil(ratio * rows)
+            encrypted_cols = math.ceil(ratio * cols)
+            self.assertEqual(
+                skeleton.decrypted_cells,
+                skeleton.selected_rank * (encrypted_rows + encrypted_cols),
+            )
+            self.assertGreater(updates[0].candidate_b_labels, 0)
+            self.assertGreater(updates[0].candidate_a_labels, 0)
+        else:
+            self.assertEqual(updates[0].sp_plain_bytes, 0)
+            self.assertEqual(updates[0].candidate_b_labels, 0)
+            self.assertEqual(updates[0].candidate_a_labels, 0)
+            self.assertGreater(skeleton.pivot_candidate_cells, 0)
         self.assertGreater(updates[0].serialized_size_bytes, 0)
+        self.assertEqual(
+            session.last_round_metrics.download_bytes_per_client,
+            skeleton.download_c_bytes
+            + skeleton.download_m_bytes
+            + skeleton.download_s_bytes,
+        )
         session.close()
+
+    def test_selective_skeleton_reconstructs_quantized_sum(self) -> None:
+        self._exercise_mode("sel-2s", 0.25)
+
+    def test_full_skeleton_reconstructs_quantized_sum(self) -> None:
+        self._exercise_mode("full-sk", 1.0)
 
 
 if __name__ == "__main__":

@@ -52,6 +52,8 @@ def train_client_one_round(
         lr=config["train"]["learning_rate"],
         weight_decay=config["train"]["weight_decay"],
     )
+    total_steps = int(config["federated"]["num_rounds"]) * local_steps
+    _learning_rate_at_step(config["train"], 0, total_steps)
 
     logger.info(
         "round %d client %d: 开始本地训练 local_steps=%d",
@@ -66,13 +68,29 @@ def train_client_one_round(
     moving_window = int(config["train"].get("loss_moving_average_window", 20))
     if moving_window <= 0:
         raise ValueError("train.loss_moving_average_window 必须为正整数")
-    recent_losses: deque[float] = deque(maxlen=moving_window)
+    moving_across_rounds = config["train"].get(
+        "loss_moving_average_across_rounds", False
+    )
+    if not isinstance(moving_across_rounds, bool):
+        raise ValueError("train.loss_moving_average_across_rounds 必须为布尔值")
+    if moving_across_rounds:
+        recent_losses = client.loss_history
+        while len(recent_losses) > moving_window:
+            recent_losses.popleft()
+    else:
+        recent_losses = deque(maxlen=moving_window)
     losses: list[float] = []
     loss_sum_total = 0.0
     supervised_tokens_total = 0
     step_times: list[float] = []
 
     for step in range(local_steps):
+        global_step = (rnd - 1) * local_steps + step
+        learning_rate = _learning_rate_at_step(
+            config["train"], global_step, total_steps
+        )
+        for parameter_group in optimizer.param_groups:
+            parameter_group["lr"] = learning_rate
         _synchronize(device)
         step_started = time.perf_counter()
         try:
@@ -91,7 +109,6 @@ def train_client_one_round(
             )
         loss.backward()
 
-        global_step = (rnd - 1) * local_steps + step
         grad_square_sum = 0.0
         for name, parameter in adapter_named_params(model, client.adapter_name):
             if parameter.grad is None:
@@ -116,13 +133,14 @@ def train_client_one_round(
         optimizer.step()
         final_loss = float(loss.detach().item())
         recent_losses.append(final_loss)
+        if moving_across_rounds and len(recent_losses) > moving_window:
+            recent_losses.popleft()
         moving_avg_loss = sum(recent_losses) / len(recent_losses)
         supervised_tokens = _supervised_token_count(batch, model_kind)
         loss_sum = final_loss * supervised_tokens
         loss_sum_total += loss_sum
         supervised_tokens_total += supervised_tokens
         losses.append(final_loss)
-        learning_rate = float(optimizer.param_groups[0]["lr"])
         perplexity = _perplexity(final_loss, model_kind)
         _synchronize(device)
         step_time = time.perf_counter() - step_started
@@ -252,3 +270,55 @@ def _perplexity(loss: float, model_kind: str) -> float:
     if model_kind != "open_llama":
         return float("nan")
     return math.exp(min(loss, 20.0))
+
+
+def _learning_rate_at_step(
+    train_config: dict,
+    global_step: int,
+    total_steps: int,
+) -> float:
+    """Return the configured constant or globally scheduled learning rate."""
+    if total_steps <= 0:
+        raise ValueError("total_steps 必须为正整数")
+    if global_step < 0 or global_step >= total_steps:
+        raise ValueError("global_step 必须位于 [0, total_steps) 范围内")
+
+    base_learning_rate = float(train_config["learning_rate"])
+    if not math.isfinite(base_learning_rate) or base_learning_rate <= 0.0:
+        raise ValueError("train.learning_rate 必须为有限正数")
+    scheduler = train_config.get("lr_scheduler")
+    if scheduler is None:
+        return base_learning_rate
+    if not isinstance(scheduler, dict):
+        raise ValueError("train.lr_scheduler 必须为映射")
+
+    scheduler_type = scheduler.get("type", "constant")
+    if scheduler_type == "constant":
+        return base_learning_rate
+    if scheduler_type != "cosine":
+        raise ValueError(f"不支持的 train.lr_scheduler.type: {scheduler_type}")
+
+    warmup_steps = int(scheduler.get("warmup_steps", 0))
+    minimum_learning_rate = float(scheduler.get("min_learning_rate", 0.0))
+    if warmup_steps < 0 or warmup_steps >= total_steps:
+        raise ValueError(
+            "train.lr_scheduler.warmup_steps 必须位于 [0, total_steps) 范围内"
+        )
+    if (
+        not math.isfinite(minimum_learning_rate)
+        or not 0.0 <= minimum_learning_rate <= base_learning_rate
+    ):
+        raise ValueError(
+            "train.lr_scheduler.min_learning_rate 必须位于 [0, learning_rate] 范围内"
+        )
+
+    if warmup_steps and global_step < warmup_steps:
+        return base_learning_rate * (global_step + 1) / warmup_steps
+
+    decay_steps = total_steps - warmup_steps
+    decay_index = global_step - warmup_steps
+    progress = decay_index / max(1, decay_steps - 1)
+    cosine_weight = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return minimum_learning_rate + (
+        base_learning_rate - minimum_learning_rate
+    ) * cosine_weight

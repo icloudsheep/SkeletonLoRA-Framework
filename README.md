@@ -36,21 +36,24 @@ conda activate skeleton_lora_fe
 
 `run.sh` 和 `evaluate.sh` 要求 Conda 环境名为 `skeleton_lora_fe`。脚本会把 Hugging Face 缓存设置到项目内的 `hf-cache/`，Linux 训练环境还会优先使用 Conda 中的 `libstdc++.so.6`。
 
-### SecLoRA SEL-2S
+### SecLoRA
 
-`SecLoRA_EndToEnd` 分支新增了独立的 `seclora/` 模块，不改动共享的
-`client/`、`server/`、`runtime/` 和 `utils/`。在训练环境中执行：
+`SecLoRA_EndToEnd` 分支提供统一的 `SEL-2S` 与 `FULL+SK` 端到端后端，
+并输出论文所需的客户端、双服务器、CUR 和真实序列化通信指标。在训练环境中执行：
 
 ```bash
 conda activate skeleton_lora_fe
 bash seclora/setup_autodl.sh
 bash seclora/verify_autodl.sh
-python main.py --config configs/seclora_end_to_end.yaml
+python main.py --config configs/seclora_3b_sel2s_010.yaml
 ```
 
-配置默认使用 4 客户端、10% 选择性加密、`Sfp=22`、`Xmax=0.03125` 和
-25 线程。原生后端复用全局 PC-DMCFE 参数、聚合密钥和 BSGS 表，每轮返回
-`C/M/S` 骨架并压回配置的 LoRA rank。协议边界与当前限制见
+3B 配置覆盖 0.125%、1%、10%、25% `SEL-2S`、`FULL+SK`、20 轮旧 Loss
+和 100 轮新 Loss。统一使用 `Sfp=22`、`Xmax=0.03125` 和 25 线程。
+选择性模式会一次加密上传 `2*K*R` 主元候选池，该成本已进入在线时间和
+通信量。完整流水线入口为 `bash run_seclora_3b_pipeline.sh`，依次执行五次
+独立训练、五次 MMLU adapter 评估和 100 轮 modern-loss 实验。协议边界、
+计时与通信口径见
 [seclora/README.md](./seclora/README.md)。
 
 ## 下载资源
@@ -153,16 +156,24 @@ output/<run_id>/
 │   ├── step.csv
 │   ├── client_round.csv
 │   ├── round.csv
+│   ├── seclora_client.csv
+│   ├── seclora_round.csv
+│   ├── seclora_layer.csv
 │   └── grad_norm.csv
+├── experiment.yaml
 └── tensorboard/
 ```
 
 - `step.csv`：逐 step loss、移动平均、困惑度、监督 token、全局梯度范数、学习率、耗时和吞吐量。
 - `client_round.csv`：每个客户端每轮的普通平均 loss、token 加权平均 loss、最小/最大/最终 loss、最终移动平均和训练耗时。
 - `round.csv`：加密耗时、明文大小、密文大小、聚合耗时和下发大小。
+- `seclora_client.csv`：SecLoRA 客户端预计算、在线加密、序列化、候选池和真实上传字节。
+- `seclora_round.csv`：论文口径的 FE aggregate、BSGS、完整 CUR、Decryption，
+  以及 `S_P`/`S_D` 审计分项、输出重建、关键路径和实际上下行通信。
+- `seclora_layer.csv`：逐 LoRA 层的维度、恢复秩、解密单元及 C/M/S 字节。
 - `grad_norm.csv`：每个 LoRA 参数张量的逐 step 梯度范数。
 
-`A.safetensors` 和 `B.safetensors` 分别保存聚合后的 LoRA A/B；`adapter_model.safetensors` 保存可直接加载的完整 adapter 状态；`final` 指向最后一轮 checkpoint。
+`experiment.yaml` 是该次运行配置的副本。`A.safetensors` 和 `B.safetensors` 分别保存聚合后的 LoRA A/B；`adapter_model.safetensors` 保存可直接加载的完整 adapter 状态；`final` 指向最后一轮 checkpoint。
 
 ## 评估
 
