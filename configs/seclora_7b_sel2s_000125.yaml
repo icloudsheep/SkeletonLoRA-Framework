@@ -1,0 +1,44 @@
+seed: 42
+
+federated:
+  num_clients: 4
+  num_rounds: 3
+  local_steps: 500
+
+lora:
+  rank: 4
+  alpha: 8
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+train:
+  batch_size: 1
+  learning_rate: 2.0e-4
+  optimizer: adamw
+  weight_decay: 0.0
+  dtype: float32
+
+model:
+  kind: open_llama
+  name: open_llama_7b_v2
+  path: ./models/open_llama_7b_v2
+  dtype: float32
+
+dataset:
+  kind: mmlu_train
+  split_method: iid_uniform
+  path: ./datasets/mmlu/mmlu_auxiliary_train.jsonl
+  max_length: 512
+
+secure_aggregation:
+  backend: seclora
+  mode: sel-2s
+  ratio: 0.00125
+  sfp: 22
+  xmax: 0.03125
+  threads: 25
+
+logging:
+  level: INFO
+
+tensorboard:
+  port: 6006
