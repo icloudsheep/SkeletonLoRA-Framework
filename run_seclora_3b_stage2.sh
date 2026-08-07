@@ -184,8 +184,15 @@ evaluate_or_reuse "sel2s-1pct" "$SEL1_CONFIG" "$SEL1_RUN_ID"
 
 echo
 echo "[stage2] phase 2/3: run 1% modern loss and draw rolling loss"
-MODERN_RUN_ID="$(train_or_reuse \
-    "modern-loss-1pct" "seclora-stage2-modern-loss-1pct" "$MODERN_CONFIG")"
+if [[ -n "${MODERN_RUN_ID:-}" ]]; then
+    MODERN_RUN_ID="$(require_existing_run \
+        "modern-loss-1pct" "seclora-stage2-modern-loss-1pct" \
+        "$MODERN_CONFIG" "$MODERN_RUN_ID")"
+    echo "[stage2] TRAIN REUSE label=modern-loss-1pct run_id=$MODERN_RUN_ID"
+else
+    MODERN_RUN_ID="$(train_or_reuse \
+        "modern-loss-1pct" "seclora-stage2-modern-loss-1pct" "$MODERN_CONFIG")"
+fi
 record_run "modern-loss-1pct" "$MODERN_CONFIG" "$MODERN_RUN_ID"
 "$CONDA_PREFIX/bin/python" "$ROOT/plot_seclora_loss.py" \
     --series "SecLoRA SEL-2S 1%=$ROOT/output/$MODERN_RUN_ID" \
